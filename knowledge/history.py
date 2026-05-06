@@ -307,6 +307,37 @@ def ingest_stage_dir(
     return (total_ingested, total_skipped)
 
 
+def sweep_inflight_debris(stage_root: Path, older_than_seconds: float) -> int:
+    """Delete ``*.inflight-*`` debris older than ``older_than_seconds``.
+
+    ``ingest_stage_dir`` renames ``sess-*.jsonl`` to ``*.inflight-<pid>-<ms>``
+    before reading, and unlinks on commit. A crash between rename and unlink
+    leaves the inflight sibling on disk — harmless (future ingests skip it
+    because the glob matches only ``sess-*.jsonl``), but it accumulates as
+    dead bytes over time.
+
+    Walks every project subdir under ``stage_root`` and unlinks matching
+    files whose mtime is older than the threshold. Returns the count.
+    Fresh inflight files (an ingest running right now) are spared.
+    """
+    if not stage_root.exists():
+        return 0
+    cutoff = time.time() - older_than_seconds
+    removed = 0
+    for project_dir in stage_root.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for f in project_dir.glob("*.inflight-*"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except FileNotFoundError:
+                # Raced with another GC / process — fine, it's gone.
+                continue
+    return removed
+
+
 def _row_to_entry(row) -> HistoryEntry:
     return HistoryEntry(
         id=row[0],

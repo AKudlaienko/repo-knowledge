@@ -103,6 +103,13 @@ def main(argv: list[str] | None = None) -> int:
              "stage dir under ~/.knowledge/stage/ and absorbs the legacy "
              "~/.knowledge/stage/pending.jsonl once if present.",
     )
+    p_h_ingest.add_argument(
+        "--gc",
+        action="store_true",
+        help="After the ingest flow, delete any *.inflight-* debris older than "
+             "1 hour (crash leftovers from interrupted ingests). Ignored when "
+             "combined with --stage-file.",
+    )
 
     p_h_recent = p_h_sub.add_parser("recent", help="Recent entries (no semantic search)")
     p_h_recent.add_argument("--days", type=int, help="Only entries from the last N days")
@@ -945,6 +952,12 @@ def cmd_history_ingest(args: argparse.Namespace) -> int:
     # Explicit single-file override: current-project, truncate-on-success.
     # Used by tests, manual replay, and internally for legacy migration.
     if args.stage_file:
+        if args.gc:
+            print(
+                "note: --gc ignored with --stage-file (GC sweeps the stage "
+                "dir, not an arbitrary path)",
+                file=sys.stderr,
+            )
         stage = Path(args.stage_file).expanduser()
         if not stage.exists() or not stage.read_text(encoding="utf-8").strip():
             print(f"stage is empty: {stage}")
@@ -971,6 +984,10 @@ def cmd_history_ingest(args: argparse.Namespace) -> int:
     # work here keeps the cost near zero when there's nothing to flush.
     if not has_legacy and not has_sess:
         print("stage is empty")
+        if args.gc:
+            removed = history.sweep_inflight_debris(paths.stage_dir(), 3600)
+            if removed > 0:
+                print(f"gc: removed {removed} inflight debris file(s)")
         return 0
 
     total_ingested = 0
@@ -1013,6 +1030,14 @@ def cmd_history_ingest(args: argparse.Namespace) -> int:
         print("stage is empty")
     if total_skipped > 0:
         print(f"skipped (malformed): {total_skipped}", file=sys.stderr)
+
+    if args.gc:
+        # 1 hour: ingest completes in seconds in practice, so anything
+        # still inflight after an hour is almost certainly crash debris.
+        removed = history.sweep_inflight_debris(paths.stage_dir(), 3600)
+        if removed > 0:
+            print(f"gc: removed {removed} inflight debris file(s)")
+
     return 0
 
 
