@@ -123,13 +123,19 @@ Skip history lookup entirely when the question is clearly about current code ("w
 
 ### During the session — write staged entries at natural boundaries
 
-At each unit-of-work completion (task done, plan signed off, a focused change shipped), **append one JSON line** to `~/.knowledge/stage/pending.jsonl`. You do NOT re-read the file — a Python helper (`knowledge history ingest`) handles parsing and DB insert later. This avoids burning tokens on re-reading your own summaries.
+At each unit-of-work completion (task done, plan signed off, a focused change shipped), run **one `knowledge history stage` command** per entry:
 
-Format (one object per line, unknown keys ignored):
+```bash
+knowledge history stage \
+  --short "Fixed ambiguous project-name resolution in forget/search." \
+  --long  "Added AmbiguousProjectName exception in projects.py. resolve_project now uses fetchall() on the name branch and raises on >1 match. cmd_search and cmd_forget catch and dispatch to _print_ambiguous. Fixes the silent-pick-one behavior.
 
-```json
-{"short": "Fixed ambiguous project-name resolution in forget/search.", "long": "Added AmbiguousProjectName exception in projects.py. resolve_project now uses fetchall() on the name branch and raises on >1 match. cmd_search and cmd_forget catch and dispatch to _print_ambiguous. Fixes the silent-pick-one behavior.\n\nFiles: knowledge/projects.py, knowledge/cli.py.\nDecision: keep error-out semantics rather than auto-pick — ambiguity should be user-resolved.", "tags": "fix,cli,projects"}
+Files: knowledge/projects.py, knowledge/cli.py.
+Decision: keep error-out semantics rather than auto-pick — ambiguity should be user-resolved." \
+  --tags "fix,cli,projects"
 ```
+
+This appends one JSONL line to `~/.knowledge/stage/<project-slug>/sess-<session-id>.jsonl` — isolated per project (via a SHA-1-suffixed slug of the repo root) and per session (via `CLAUDE_SESSION_ID` when present, falling back to `pid<PID>-<epoch>`). You do NOT re-read the file; `knowledge history ingest` handles parsing and DB insert later, which avoids burning tokens on re-reading your own summaries.
 
 Guidelines:
 - **Short** ≤ ~160 chars. The imperative-summary bar: someone skimming `recent` should know what happened. One line.
@@ -143,17 +149,18 @@ Guidelines:
 Run `knowledge history ingest` when you want to durably persist staged entries:
 
 ```bash
-knowledge history ingest                                # default path
-knowledge history ingest --stage-file /path/to/x.jsonl  # override
+knowledge history ingest                                # walks all per-project stage dirs
+knowledge history ingest --stage-file /path/to/x.jsonl  # override: flush one file under current project
 ```
 
-Behavior:
-- Reads all JSONL lines, embeds the short summaries in one batch, inserts rows transactionally.
-- On SQL success → truncates the stage file to zero bytes.
-- On SQL failure → leaves the file intact; new entries can still be appended and a later ingest will pick up everything.
-- Malformed lines (bad JSON, missing short/long, empty short) are skipped and counted in the output; they do **not** block the valid entries.
+Behavior (default flow):
+- Walks every `~/.knowledge/stage/<slug>/` dir and processes each `sess-*.jsonl` file under its own APSW savepoint.
+- Each file is atomically renamed to `*.inflight-<pid>-<ts>` before it's read — so three near-simultaneous hook firings (Stop, PreCompact, SessionEnd) can't double-ingest the same file. The winning process deletes the inflight file on commit; any loser skips silently.
+- Embeds short summaries in one batch per file and inserts rows transactionally.
+- Malformed lines (bad JSON, missing short/long, empty short) are skipped and counted; they do **not** block the valid entries or other files.
+- A one-shot migration absorbs the legacy `~/.knowledge/stage/pending.jsonl` (from earlier versions) under the current project, then deletes it.
 
-**When to ingest:** after a batch of entries (e.g. end of a focused work stretch), or before a context-window compact event. In Phase 2 a `PreCompact` hook will do this automatically; for now, it's explicit.
+**When to ingest:** after a batch of entries (e.g. end of a focused work stretch), or before a context-window compact event. A `PreCompact`/`Stop`/`SessionEnd` hook (installed by `knowledge install-hooks`) does this automatically; manual invocation is still fine.
 
 ### Rules for history
 

@@ -85,10 +85,23 @@ def main(argv: list[str] | None = None) -> int:
     p_h_add.add_argument("--tags", help="Optional comma-separated tags")
     p_h_add.add_argument("--session-id", help="Optional session identifier")
 
+    p_h_stage = p_h_sub.add_parser(
+        "stage",
+        help="Append one entry to the per-project, per-session JSONL stage "
+             "(no DB write; flush later with `knowledge history ingest`).",
+    )
+    p_h_stage.add_argument("--short", required=True, help="One-line summary (~160 chars)")
+    p_h_stage.add_argument("--long", required=True, help="Detailed summary with file refs + rationale")
+    p_h_stage.add_argument("--tags", help="Optional comma-separated tags")
+    p_h_stage.add_argument("--session-id", help="Optional session identifier (stored with the entry)")
+
     p_h_ingest = p_h_sub.add_parser("ingest", help="Flush staged JSONL entries into SQLite")
     p_h_ingest.add_argument(
         "--stage-file",
-        help="Path to the JSONL stage (default: ~/.knowledge/stage/pending.jsonl)",
+        help="Override: flush exactly this one JSONL file under the current project "
+             "(truncates on success). Without it, ingest walks every per-project "
+             "stage dir under ~/.knowledge/stage/ and absorbs the legacy "
+             "~/.knowledge/stage/pending.jsonl once if present.",
     )
 
     p_h_recent = p_h_sub.add_parser("recent", help="Recent entries (no semantic search)")
@@ -784,8 +797,8 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
     print()
     print("to verify:")
     print(
-        "  1. append a JSON entry to ~/.knowledge/stage/pending.jsonl in a "
-        "running session"
+        "  1. `knowledge history stage --short '...' --long '...'` "
+        "(appends to ~/.knowledge/stage/<project>/sess-<id>.jsonl)"
     )
     print("  2. run /compact (or let auto-compact fire)")
     print("  3. `knowledge history recent --limit 1` — the entry should be there")
@@ -876,30 +889,130 @@ def cmd_history_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_history_stage(args: argparse.Namespace) -> int:
+    """Append one JSONL entry to the per-project, per-session stage file.
+
+    No DB write for the entry itself — a later ``knowledge history ingest``
+    flushes it under an APSW savepoint. We *do* register the project
+    (``get_or_create_project``) so ingest can resolve the dir back to a
+    project without re-hashing every known root. The project row is cheap
+    and the user is about to write durable work-history into it anyway, so
+    the "no empty rows for random cwds" concern from the ingest fast path
+    doesn't apply here.
+    """
+    import fcntl  # POSIX-only; repo-knowledge doesn't support Windows.
+
+    short = args.short.strip()
+    long_ = args.long.strip()
+    if not short or not long_:
+        print("error: --short and --long must be non-empty", file=sys.stderr)
+        return 2
+
+    root = projects.current_project_root()
+    with db.connect() as conn:
+        proj = projects.get_or_create_project(conn, root)
+
+    project_dir = paths.project_stage_dir(root)
+    sidecar = paths.root_sidecar_path(project_dir)
+    if not sidecar.exists():
+        sidecar.write_text(f"{proj.root_path}\n", encoding="utf-8")
+
+    stage = paths.session_stage_file(root)
+    entry: dict = {"short": short, "long": long_}
+    if args.tags:
+        entry["tags"] = args.tags
+    if args.session_id:
+        entry["session_id"] = args.session_id
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+
+    # flock serializes appends if two Bash invocations from the same
+    # session race. O_APPEND alone is only atomic up to PIPE_BUF (~4 KB);
+    # long_summary can exceed that. flock is a cheap guarantee.
+    with open(stage, "a", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fh.write(line)
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    print(f"staged in '{proj.name}' ({stage})")
+    return 0
+
+
 def cmd_history_ingest(args: argparse.Namespace) -> int:
     from . import history
 
-    stage = (
-        Path(args.stage_file).expanduser() if args.stage_file else paths.stage_path()
-    )
-    # Empty-stage fast path — no DB touch. Critical for user-scoped hooks
-    # that fire on every session: if we called get_or_create_project here,
-    # every random repo the user opens would accrete an empty project row.
-    if not stage.exists() or not stage.read_text(encoding="utf-8").strip():
-        print(f"stage is empty: {stage}")
+    # Explicit single-file override: current-project, truncate-on-success.
+    # Used by tests, manual replay, and internally for legacy migration.
+    if args.stage_file:
+        stage = Path(args.stage_file).expanduser()
+        if not stage.exists() or not stage.read_text(encoding="utf-8").strip():
+            print(f"stage is empty: {stage}")
+            return 0
+        with db.connect() as conn:
+            root = projects.current_project_root()
+            proj = projects.get_or_create_project(conn, root)
+            ingested, skipped = history.ingest_stage(conn, stage, proj.id)
+        if ingested > 0:
+            print(f"ingested: {ingested} into '{proj.name}' ({proj.root_path})")
+            print(f"stage file truncated: {stage}")
+        if skipped > 0:
+            print(f"skipped (malformed): {skipped}", file=sys.stderr)
         return 0
-    with db.connect() as conn:
-        root = projects.current_project_root()
-        proj = projects.get_or_create_project(conn, root)
-        ingested, skipped = history.ingest_stage(conn, stage, proj.id)
 
-    if ingested > 0:
-        print(
-            f"ingested: {ingested} into '{proj.name}' ({proj.root_path})"
-        )
-        print(f"stage file truncated: {stage}")
-    if skipped > 0:
-        print(f"skipped (malformed): {skipped}", file=sys.stderr)
+    # Default flow: walk every per-project stage dir + absorb legacy file.
+    legacy = paths.legacy_stage_path()
+    project_dirs = paths.iter_stage_project_dirs()
+    has_legacy = legacy.exists() and legacy.read_text(encoding="utf-8").strip() != ""
+    has_sess = any(any(d.glob("sess-*.jsonl")) for d in project_dirs)
+
+    # Empty-stage fast path — no DB connect. The hook fires on every Stop /
+    # PreCompact / SessionEnd for every repo the user touches; skipping DB
+    # work here keeps the cost near zero when there's nothing to flush.
+    if not has_legacy and not has_sess:
+        print("stage is empty")
+        return 0
+
+    total_ingested = 0
+    total_skipped = 0
+    per_project: list[tuple[str, Path, int]] = []  # (name, root, ingested)
+
+    with db.connect() as conn:
+        # Legacy file: absorb under current cwd's project (same heuristic
+        # the tool has always used), then delete so we don't migrate twice.
+        if has_legacy:
+            root = projects.current_project_root()
+            proj = projects.get_or_create_project(conn, root)
+            i, s = history.ingest_stage(conn, legacy, proj.id)
+            legacy.unlink(missing_ok=True)
+            total_ingested += i
+            total_skipped += s
+            if i > 0:
+                per_project.append((proj.name, proj.root_path, i))
+
+        # Per-project dirs: resolve each via its .root sidecar.
+        for pd in project_dirs:
+            sidecar = paths.root_sidecar_path(pd)
+            if not sidecar.exists():
+                # Orphan dir (no sidecar → can't resolve). Skip silently;
+                # a future `stage` call in the matching repo re-creates it.
+                continue
+            root_str = sidecar.read_text(encoding="utf-8").strip()
+            if not root_str:
+                continue
+            proj = projects.get_or_create_project(conn, Path(root_str))
+            i, s = history.ingest_stage_dir(conn, pd, proj.id)
+            total_ingested += i
+            total_skipped += s
+            if i > 0:
+                per_project.append((proj.name, proj.root_path, i))
+
+    for name, rpath, count in per_project:
+        print(f"ingested: {count} into '{name}' ({rpath})")
+    if total_ingested == 0 and total_skipped == 0:
+        print("stage is empty")
+    if total_skipped > 0:
+        print(f"skipped (malformed): {total_skipped}", file=sys.stderr)
     return 0
 
 
@@ -994,6 +1107,7 @@ def cmd_history_get(args: argparse.Namespace) -> int:
 
 _HISTORY_DISPATCH = {
     "add": cmd_history_add,
+    "stage": cmd_history_stage,
     "ingest": cmd_history_ingest,
     "recent": cmd_history_recent,
     "search": cmd_history_search,

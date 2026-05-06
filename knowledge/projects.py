@@ -196,15 +196,25 @@ def next_free_suffix(conn: Connection, base: str) -> str:
 
 
 def forget_project(conn: Connection, project_id: int) -> None:
-    """Cascade-delete a project. Files + chunks go with it (FK ON DELETE CASCADE).
+    """Cascade-delete a project. Files, chunks, and history go with it via
+    ``ON DELETE CASCADE`` on the ``projects`` FK.
 
-    Vector rows are orphaned but harmless — they're filtered out by the JOIN
-    on ``chunks.project_id`` at search time. A future ``knowledge vacuum``
-    can purge them if size becomes an issue.
+    Virtual-table rows (``chunks_vec``, ``history_vec``) must be cleaned
+    explicitly — ``vec0`` doesn't participate in FK cascade. ``chunks_vec``
+    orphans would be harmless (the search JOIN on ``chunks.project_id``
+    filters them), but ``history_vec`` orphans break the next ingest:
+    ``history.id`` is ``INTEGER PRIMARY KEY`` without ``AUTOINCREMENT``, so
+    SQLite reuses freed rowids, and the first new history INSERT collides
+    with a stale ``history_vec`` PK.
     """
     conn.execute(
         "DELETE FROM chunks_vec WHERE chunk_id IN "
         "(SELECT id FROM chunks WHERE project_id = ?)",
+        (project_id,),
+    )
+    conn.execute(
+        "DELETE FROM history_vec WHERE history_id IN "
+        "(SELECT id FROM history WHERE project_id = ?)",
         (project_id,),
     )
     conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))

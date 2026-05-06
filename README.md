@@ -87,9 +87,9 @@ If `knowledge` lives in a venv (`which knowledge` points at something like `/Use
 You can switch modes any time — re-run `install-hooks` with or without `--absolute`; the in-place upgrade rewrites existing entries cleanly.
 
 **Verify the flow:**
-1. Append a JSON entry to `~/.knowledge/stage/pending.jsonl` during a running Claude Code session.
+1. Run `knowledge history stage --short "..." --long "..."` during a Claude Code session. This appends to `~/.knowledge/stage/<project-slug>/sess-<session-id>.jsonl` — isolated per project and per session so concurrent Claude instances can't clobber each other's staged work.
 2. Run `/compact` (or let auto-compact fire).
-3. `knowledge history recent --limit 1` — the entry should be in the DB and the stage file truncated to zero bytes.
+3. `knowledge history recent --limit 1` — the entry should be in the DB and the per-session stage file gone (ingest deletes it after a successful flush).
 
 ## What's indexed
 
