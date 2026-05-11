@@ -54,6 +54,144 @@ def main(argv: list[str] | None = None) -> int:
     p_search.add_argument("--with-siblings", action="store_true")
     p_search.add_argument("--json", action="store_true")
 
+    # find — exact / prefix / regex lookup by symbol name. Schema v2+.
+    # No embedding: hits partial indexes idx_chunks_name / idx_chunks_qname
+    # directly. O(log n), under 10ms typical.
+    p_find = sub.add_parser(
+        "find",
+        help="Exact-name lookup by chunk name or qualified_name (no embedding).",
+    )
+    p_find.add_argument("name", help="Symbol name (prefix by default; see --exact/--regex)")
+    p_find.add_argument("--exact", action="store_true", help="Exact match instead of prefix")
+    p_find.add_argument("--regex", action="store_true", help="Python regex (overrides --exact)")
+    p_find.add_argument("--kind", help="Filter by chunk kind (function, resource, …)")
+    p_find.add_argument("--lang", help="Filter by language")
+    p_find.add_argument("--limit", type=int, default=10)
+    p_find.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_find.add_argument("--all-projects", action="store_true")
+    p_find.add_argument(
+        "--format",
+        choices=("citations", "chunks", "json"),
+        default="citations",
+        help="Output format (default: citations — one 'path:lines | kind | excerpt' per line)",
+    )
+
+    # grep — FTS5 MATCH over name, qualified_name, stored_text. Schema v2+.
+    # Full FTS5 query syntax: quoted phrases, prefix foo*, boolean AND/OR,
+    # column qualifier name:foo. No embedding.
+    p_grep = sub.add_parser(
+        "grep",
+        help="FTS5 full-text match over chunk names + stored text (no embedding).",
+    )
+    p_grep.add_argument("pattern", help="FTS5 query (phrases, prefix foo*, AND/OR, name:X, ...)")
+    p_grep.add_argument("--kind", help="Filter by chunk kind (function, resource, …)")
+    p_grep.add_argument("--lang", help="Filter by language")
+    p_grep.add_argument("--limit", type=int, default=10)
+    p_grep.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_grep.add_argument("--all-projects", action="store_true")
+    p_grep.add_argument(
+        "--format",
+        choices=("citations", "chunks", "json"),
+        default="citations",
+    )
+
+    # ask — hybrid lexical + semantic retrieval with reranking (Phase 3).
+    # Agent-first: citations output by default, answer cache warms
+    # automatically, token budget truncates gracefully.
+    p_ask = sub.add_parser(
+        "ask",
+        help="Hybrid search (FTS + vec, RRF merge, reranked). Best default for agents.",
+    )
+    p_ask.add_argument("question", help="Free-text query")
+    p_ask.add_argument("--top-k", type=int, default=10)
+    p_ask.add_argument("--kind", help="Filter by chunk kind")
+    p_ask.add_argument("--lang", help="Filter by language")
+    p_ask.add_argument(
+        "--budget",
+        type=int,
+        default=0,
+        help="Soft token budget — truncate citations list to roughly this many tokens (0=off)",
+    )
+    p_ask.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_ask.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass the answer cache (force fresh FTS + vec on every call)",
+    )
+    p_ask.add_argument(
+        "--format",
+        choices=("citations", "chunks", "json"),
+        default="citations",
+    )
+
+    # why — 6-line file brief (Phase 2 cartography).
+    p_why = sub.add_parser(
+        "why",
+        help="One-file brief: description, top symbols, neighbors (no embedder).",
+    )
+    p_why.add_argument("path", help="File path (repo-relative, absolute, or cwd-relative)")
+    p_why.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # map — directory tree with per-dir aggregates.
+    p_map = sub.add_parser(
+        "map",
+        help="Directory-tree overview: file counts, langs, hub files per subtree.",
+    )
+    p_map.add_argument(
+        "--dir",
+        dest="dir_filter",
+        help="Limit to files under this directory prefix (e.g. 'terraform')",
+    )
+    p_map.add_argument("--depth", type=int, default=2, help="Group by first N path components (default 2)")
+    p_map.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # brief — repo-level snapshot.
+    p_brief = sub.add_parser(
+        "brief",
+        help="Repo-wide summary: totals, top langs, hub files.",
+    )
+    p_brief.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # decide — record a non-obvious choice (Phase 4 session memory).
+    p_decide = sub.add_parser(
+        "decide",
+        help="Record a non-obvious choice with rationale + files touched.",
+    )
+    p_decide.add_argument("topic", help="Short label (e.g. 'cache invalidation')")
+    p_decide.add_argument("--decision", required=True, help="The choice itself")
+    p_decide.add_argument("--rationale", help="One-line 'why' (optional)")
+    p_decide.add_argument(
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Files touched by this decision (optional)",
+    )
+    p_decide.add_argument("--session-id", help="Tag with session identifier")
+    p_decide.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # decisions — list / search past decisions.
+    p_decs = sub.add_parser(
+        "decisions",
+        help="List or search recorded decisions.",
+    )
+    p_decs.add_argument("--topic", help="Case-insensitive substring filter on topic")
+    p_decs.add_argument("--search", dest="search_q", help="Semantic search over topic+decision")
+    p_decs.add_argument("--days", type=int, help="Only entries from the last N days")
+    p_decs.add_argument("--limit", type=int, default=20)
+    p_decs.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_decs.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+    )
+
+    # resume — opinionated session-start brief.
+    p_resume = sub.add_parser(
+        "resume",
+        help='"Where did I leave off?" — decisions + touched files + pending stage + hubs.',
+    )
+    p_resume.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
     # get
     p_get = sub.add_parser("get", help="Fetch a chunk by id")
     p_get.add_argument("chunk_id", type=int)
@@ -508,6 +646,470 @@ def cmd_search(args: argparse.Namespace) -> int:
     else:
         _print_results_pretty(results)
     return 0
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    """Exact/prefix/regex symbol lookup — schema v2+."""
+    from . import fts
+
+    with db.connect() as conn:
+        project_id = _resolve_scope(conn, args)
+        if project_id is _SCOPE_ERROR:
+            return 1
+        try:
+            results = fts.find(
+                conn,
+                name=args.name,
+                project_id=project_id,
+                exact=args.exact,
+                regex=args.regex,
+                kind=args.kind,
+                lang=args.lang,
+                limit=args.limit,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    _emit_results(results, args.format)
+    return 0
+
+
+def cmd_grep(args: argparse.Namespace) -> int:
+    """FTS5 MATCH lookup — schema v2+."""
+    import apsw  # FTS5 syntax errors surface as apsw.SQLError.
+    from . import fts
+
+    with db.connect() as conn:
+        project_id = _resolve_scope(conn, args)
+        if project_id is _SCOPE_ERROR:
+            return 1
+        try:
+            results = fts.grep(
+                conn,
+                pattern=args.pattern,
+                project_id=project_id,
+                kind=args.kind,
+                lang=args.lang,
+                limit=args.limit,
+            )
+        except apsw.SQLError as exc:
+            print(
+                f"error: invalid FTS5 query: {exc}\n"
+                "examples: 'vault auth', '\"exact phrase\"', 'foo*', "
+                "'vault AND approle', 'name:handle_*'.",
+                file=sys.stderr,
+            )
+            return 1
+
+    _emit_results(results, args.format)
+    return 0
+
+
+# Sentinel for _resolve_scope — distinguishes "error emitted, bail out"
+# from the legitimate ``None`` value meaning "--all-projects".
+_SCOPE_ERROR: object = object()
+
+
+def _resolve_scope(conn, args) -> int | None | object:
+    """Return project_id (int), None (all-projects), or _SCOPE_ERROR.
+
+    Shared by find/grep. Emits the error message to stderr on failure so
+    the caller just has to check for the sentinel and return 1.
+    """
+    if getattr(args, "all_projects", False):
+        return None
+    try:
+        proj = projects.resolve_project(conn, args.project)
+    except projects.AmbiguousProjectName as exc:
+        _print_ambiguous(exc)
+        return _SCOPE_ERROR
+    if proj is None:
+        where = args.project or str(projects.current_project_root())
+        print(
+            f"error: project not registered: {where}\n"
+            "run 'knowledge build' from the repo root first.",
+            file=sys.stderr,
+        )
+        return _SCOPE_ERROR
+    return proj.id
+
+
+def _emit_results(results, fmt: str) -> None:
+    """Dispatch SearchResult list to the chosen formatter."""
+    if fmt == "json":
+        print(json.dumps([r._asdict() for r in results], indent=2, default=str))
+    elif fmt == "chunks":
+        _print_results_pretty(results)
+    else:  # citations
+        _print_results_citations(results)
+
+
+def _print_results_citations(results) -> None:
+    """One result per line, parseable with ``split(' | ', 2)``.
+
+    Format: ``rel/path:start-end | kind | one-line excerpt``.
+
+    The excerpt is the first non-empty line of the stored text after
+    whitespace decompression, trimmed at 160 chars so an LLM can diff
+    results at a glance without scrolling.
+    """
+    if not results:
+        return
+    from .whitespace import decompress
+
+    for r in results:
+        excerpt = _first_line(decompress(r.preview))
+        print(f"{r.rel_path}:{r.start_line}-{r.end_line} | {r.kind} | {excerpt}")
+
+
+def _first_line(text: str, max_chars: int = 160) -> str:
+    """Collapse to the first meaningful line for a citation excerpt."""
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s:
+            return s[:max_chars]
+    return ""
+
+
+def cmd_decide(args: argparse.Namespace) -> int:
+    """Record a decision — Phase 4 session memory."""
+    from . import decisions as decisions_mod
+
+    topic = args.topic.strip()
+    decision = args.decision.strip()
+    if not topic or not decision:
+        print("error: topic and --decision must be non-empty", file=sys.stderr)
+        return 2
+
+    with db.connect() as conn:
+        # `decide` should work even before a `build`; auto-create the project
+        # row the same way `history add` does.
+        root = projects.current_project_root()
+        proj = projects.get_or_create_project(conn, root)
+        new_id = decisions_mod.add(
+            conn,
+            project_id=proj.id,
+            topic=topic,
+            decision=decision,
+            rationale=args.rationale,
+            files_touched=args.files,
+            session_id=args.session_id,
+        )
+    print(f"recorded decision id={new_id} in '{proj.name}' ({proj.root_path})")
+    return 0
+
+
+def cmd_decisions(args: argparse.Namespace) -> int:
+    """List / search decisions — Phase 4."""
+    from . import decisions as decisions_mod
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        if args.search_q:
+            raw = decisions_mod.search(
+                conn,
+                query=args.search_q,
+                project_id=proj.id,
+                top_k=args.limit,
+            )
+            entries = [(d, dist) for d, dist in raw]
+        else:
+            plain = decisions_mod.recent(
+                conn,
+                project_id=proj.id,
+                days=args.days,
+                topic=args.topic,
+                limit=args.limit,
+            )
+            # Pair with None distance so the formatter handles both paths uniformly.
+            entries = [(d, None) for d in plain]
+
+    if args.format == "json":
+        print(json.dumps(
+            [
+                {"decision": d._asdict(), "distance": dist}
+                for d, dist in entries
+            ],
+            indent=2,
+            default=str,
+        ))
+    else:
+        _print_decisions(entries)
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Session-start brief — Phase 4 session memory."""
+    from . import resume as resume_mod
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        brief = resume_mod.build(
+            conn,
+            project_id=proj.id,
+            project_name=proj.name,
+            project_root=proj.root_path,
+        )
+    _print_resume(brief)
+    return 0
+
+
+def _print_decisions(entries) -> None:
+    """Pretty-print (Decision, distance|None) tuples."""
+    from datetime import datetime
+
+    if not entries:
+        print("(no decisions)")
+        return
+    for d, dist in entries:
+        when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d %H:%M")
+        dist_s = f"  dist={dist:.3f}" if dist is not None else ""
+        print(f"{when}  id={d.id}{dist_s}")
+        print(f"  topic:    {d.topic}")
+        print(f"  decision: {d.decision}")
+        if d.rationale:
+            print(f"  why:      {d.rationale}")
+        if d.files_touched:
+            print(f"  files:    {', '.join(d.files_touched)}")
+
+
+def _print_resume(rb) -> None:
+    """Four-block session-start brief. Plain text, token-budget-aware."""
+    from datetime import datetime
+
+    print(f"{rb.project_name}  ({rb.project_root})")
+    print(
+        f"history: {rb.total_history_entries} entries  "
+        f"decisions: {rb.total_decisions}"
+    )
+
+    # 1. Decisions
+    print("\n# recent decisions")
+    if not rb.last_decisions:
+        print("  (none yet — log with `knowledge decide`)")
+    else:
+        for d in rb.last_decisions:
+            when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d")
+            print(f"  {when}  {d.topic}")
+            print(f"            → {d.decision}")
+
+    # 2. Touched files
+    print("\n# most-touched files (last 7d)")
+    if not rb.touched_files:
+        print("  (no history tokens or recent commits matched indexed files)")
+    else:
+        for rel, score in rb.touched_files:
+            print(f"  [{score:>2}] {rel}")
+
+    # 3. Pending stage
+    if rb.pending_stage:
+        print("\n# pending in stage (not yet ingested)")
+        for entry in rb.pending_stage:
+            short = str(entry.get("short", "?")).strip()
+            print(f"  - {short[:100]}")
+
+    # 4. Hub files
+    if rb.hub_files:
+        print("\n# hub files (orientation)")
+        for rel, deg in rb.hub_files:
+            print(f"  {deg:>3}×  {rel}")
+
+    # Footer guidance for the agent reading this output.
+    print(
+        "\n# how to proceed\n"
+        "  - use `knowledge ask '<question>'` for search\n"
+        "  - use `knowledge why <path>` to understand one file\n"
+        "  - log non-obvious choices with `knowledge decide <topic> --decision <...>`"
+    )
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Hybrid search + rerank + cache — Phase 3 entry point for agents."""
+    from . import hybrid_search
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        results = hybrid_search.ask(
+            conn,
+            query=args.question,
+            project_id=proj.id,
+            project_root=proj.root_path,
+            kind=args.kind,
+            lang=args.lang,
+            top_k=args.top_k,
+            use_cache=not args.no_cache,
+        )
+
+    kept, omitted = hybrid_search.truncate_to_budget(results, args.budget)
+    _emit_results(kept, args.format)
+    if omitted > 0 and args.format == "citations":
+        print(f"...{omitted} more omitted (raise --budget to see)")
+    return 0
+
+
+def cmd_why(args: argparse.Namespace) -> int:
+    """One-file brief — Phase 2 cartography."""
+    from . import cartography
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        rel_path = _resolve_relations_target(args.path, proj.root_path)
+        brief = cartography.why(conn, rel_path, proj.id, proj.root_path)
+
+    if brief is None:
+        print(
+            f"error: file not indexed: {rel_path}\n"
+            "check the path, or run 'knowledge update' if the file is new.",
+            file=sys.stderr,
+        )
+        return 1
+    _print_why(brief)
+    return 0
+
+
+def cmd_map(args: argparse.Namespace) -> int:
+    """Directory-tree overview — Phase 2 cartography."""
+    from . import cartography
+
+    if args.depth < 1:
+        print("error: --depth must be >= 1", file=sys.stderr)
+        return 1
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        entries, truncated = cartography.map_tree(
+            conn,
+            project_id=proj.id,
+            dir_filter=args.dir_filter,
+            depth=args.depth,
+        )
+
+    if not entries:
+        scope = f" under '{args.dir_filter}'" if args.dir_filter else ""
+        print(f"(no files indexed{scope} for {proj.name})")
+        return 0
+    _print_map(entries, proj, truncated, args.dir_filter, args.depth)
+    return 0
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    """Repo-wide snapshot — Phase 2 cartography."""
+    from . import cartography
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        rb = cartography.brief(
+            conn,
+            project_id=proj.id,
+            project_name=proj.name,
+            project_root=str(proj.root_path),
+            last_updated=proj.last_update,
+        )
+    _print_brief(rb)
+    return 0
+
+
+def _print_why(b) -> None:
+    """Render a :class:`FileBrief` as a compact text block."""
+    print(f"{b.rel_path}")
+    meta = f"  lang={b.lang}  loc={b.loc}  size={_format_bytes(b.size)}"
+    if b.last_commit_date:
+        meta += f"  last_commit={b.last_commit_date}"
+    print(meta)
+
+    if b.description:
+        print(f"  desc: {b.description}")
+
+    if b.top_symbols:
+        print("  top symbols:")
+        for kind, name, sl, el, _cc in b.top_symbols:
+            print(f"    [{kind}] {name}  ({sl}-{el})")
+
+    if b.inbound:
+        print("  inbound:")
+        for src, kind in b.inbound:
+            print(f"    ← {src}  ({kind})")
+    if b.outbound:
+        print("  outbound:")
+        for tgt, kind in b.outbound:
+            print(f"    → {tgt}  ({kind})")
+    if not b.inbound and not b.outbound:
+        print("  (no resolved cross-file edges)")
+
+
+def _print_map(entries, proj, truncated: bool, dir_filter, depth: int) -> None:
+    """Render a directory map as a fixed-width table."""
+    header_dir = "DIR"
+    header = f"{header_dir:<38} {'FILES':>6} {'LANG':<12}  TOP KINDS / ENTRYPOINT"
+    print(f"{proj.name} ({proj.root_path})")
+    if dir_filter:
+        print(f"filter: {dir_filter}  depth: {depth}")
+    else:
+        print(f"depth: {depth}")
+    print(header)
+    print("-" * len(header))
+    for e in entries:
+        kinds = ", ".join(f"{k}×{n}" for k, n in e.top_kinds) or "-"
+        entrypoint = f"  →{e.entrypoint}" if e.entrypoint else ""
+        dir_display = e.dir_path or "(repo root)"
+        # Truncate excessively long dir paths so the table stays aligned.
+        if len(dir_display) > 37:
+            dir_display = "…" + dir_display[-36:]
+        print(
+            f"{dir_display:<38} {e.file_count:>6} "
+            f"{(e.dominant_lang or '-'):<12}  {kinds}{entrypoint}"
+        )
+    if truncated:
+        print(
+            "\nwarning: output truncated at 200 directory rows. "
+            "Narrow with --dir <path> or reduce --depth.",
+            file=sys.stderr,
+        )
+
+
+def _print_brief(rb) -> None:
+    """Render a :class:`RepoBrief`."""
+    from datetime import datetime
+
+    print(f"{rb.project_name}  ({rb.project_root})")
+    if rb.last_updated:
+        print(f"last_update: {datetime.fromtimestamp(rb.last_updated).strftime('%Y-%m-%d %H:%M')}")
+    print(f"files={rb.file_count}  chunks={rb.chunk_count}  edges={rb.edge_count}")
+
+    if rb.top_langs:
+        print("\ntop langs:")
+        for lang, n in rb.top_langs:
+            print(f"  {lang:<14} {n}")
+
+    if rb.hub_files:
+        print("\nhub files (by in-degree):")
+        for rel, deg in rb.hub_files:
+            print(f"  {deg:>3}×  {rel}")
+    else:
+        print("\n(no resolved cross-file edges)")
+
+
+def _format_bytes(size: int) -> str:
+    """Compact byte-size like '4.2KB' / '1.1MB'. Zero returns '0B'."""
+    s: float = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if s < 1024:
+            return f"{s:.1f}{unit}" if unit != "B" else f"{int(s)}B"
+        s /= 1024
+    return f"{s:.1f}TB"
 
 
 def cmd_get(args: argparse.Namespace) -> int:
@@ -1843,6 +2445,15 @@ _DISPATCH = {
     "update": cmd_update,
     "status": cmd_status,
     "search": cmd_search,
+    "find": cmd_find,
+    "grep": cmd_grep,
+    "ask": cmd_ask,
+    "why": cmd_why,
+    "map": cmd_map,
+    "brief": cmd_brief,
+    "decide": cmd_decide,
+    "decisions": cmd_decisions,
+    "resume": cmd_resume,
     "get": cmd_get,
     "path": cmd_path,
     "projects": cmd_projects,

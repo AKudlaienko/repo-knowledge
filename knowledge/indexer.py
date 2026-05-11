@@ -34,7 +34,7 @@ import json
 import time
 from pathlib import Path
 
-from . import config, db, relations
+from . import config, db, query_cache, relations
 from .big_split import split_if_oversized
 from .chunkers import dispatch_chunker
 from .chunkers.base import Chunk
@@ -57,6 +57,11 @@ def build_project(
     project = get_or_create_project(conn, root, name_override)
 
     with conn:  # APSW: outer savepoint = one atomic transaction
+        # Any prior `ask` answer for this project is stale after a full
+        # rebuild — chunk IDs / file paths may change. Wipe within the
+        # same txn so cache state stays consistent with chunk state.
+        query_cache.wipe_project(conn, project.id)
+
         # Clean slate for this project. chunks_vec has no FK cascade (virtual
         # table), so we clear it first before chunks drops the ids it refs.
         conn.execute(
@@ -171,6 +176,17 @@ def build_project(
             "UPDATE projects SET last_build = ?, last_update = ? WHERE id = ?",
             (now, now, project.id),
         )
+
+        # Bump meta to the currently-compiled versions. `init_schema` seeds
+        # these only on fresh init, so without this line a v1→v2 rebuild
+        # leaves `meta.schema_version = "1"` — and the next `update` run
+        # would loop into another forced rebuild forever.
+        for k, v in {
+            "schema_version":  config.SCHEMA_VERSION,
+            "chunker_version": config.CHUNKER_VERSION,
+            "embedding_model": config.MODEL,
+        }.items():
+            db.set_meta(conn, k, v)
 
     # update_counts queries outside the savepoint above — harmless, auto-commits.
     update_counts(conn, project.id)
@@ -349,6 +365,13 @@ def update_project(
             "UPDATE projects SET last_update = ? WHERE id = ?",
             (now, project.id),
         )
+
+        # Invalidate cache only when something actually changed. A no-op
+        # update (all files byte-identical) shouldn't wipe cached answers
+        # that are still correct, which matters when the agent runs
+        # `knowledge update` as a hook on every turn.
+        if files_new or files_changed or files_deleted:
+            query_cache.wipe_project(conn, project.id)
 
     update_counts(conn, project.id)
 

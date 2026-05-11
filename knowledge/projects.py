@@ -217,6 +217,11 @@ def forget_project(conn: Connection, project_id: int) -> None:
         "(SELECT id FROM history WHERE project_id = ?)",
         (project_id,),
     )
+    conn.execute(
+        "DELETE FROM decisions_vec WHERE decision_id IN "
+        "(SELECT id FROM decisions WHERE project_id = ?)",
+        (project_id,),
+    )
     conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
 
 

@@ -1,37 +1,138 @@
 ---
 name: knowledge
-description: Local semantic code search across the current repo. Auto-builds or updates the local index, then returns the exact chunks (function / class / ansible task / terraform resource / helm values / markdown section / …) that match the user's question. Use this instead of raw Grep when the query is about meaning ("how does X work", "where is Y configured") rather than exact strings.
-argument-hint: [query] [--kind K] [--lang L] [--all-projects]
+description: Local code cartography + semantic search for the current repo. Navigate (find / grep), orient (why / map / brief), search (ask — hybrid FTS+vector+rerank, cached), and remember across sessions (decide / resume). Auto-builds or updates the local index. Use BEFORE raw Grep / Read for anything meaning-shaped.
+argument-hint: [verb] [args]
 allowed-tools: Bash Read
 ---
 
-# /knowledge — Local semantic code search
+# /knowledge — Code cartography + semantic search + session memory
 
-Complements `Grep` (exact text) and `graphify` (structural dependencies) by answering *meaning* questions: "how does vault auth work", "where is the load balancer defined", "what generates the workload cluster manifest". One SQLite DB at `~/.knowledge/index.sqlite` holds chunks + embeddings for every repo the user has indexed.
+One SQLite DB at `~/.knowledge/index.sqlite` holds chunks, edges, history, and decisions for every repo the user has indexed. Complements `Grep` (exact text) and `graphify` (one-off structural dependencies).
 
-## Auto-maintenance — run BEFORE searching
+## Priority directives — READ FIRST
 
-On every invocation, check + refresh the index for the current repo. These three steps run in order:
+These three rules apply on every invocation. They exist because they reduce tool-call count and keep cross-session continuity intact.
 
-### 1. Check state
+1. **On a new session, run `knowledge resume` BEFORE any other tool** in this skill.  It returns last decisions + touched files + any un-ingested stage entries + hub files. ~1200 tokens, <200ms. Skip only when the user's very first message makes it obvious (e.g. a typo fix on a specific line).
+
+2. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha). `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
+
+3. **Log non-obvious choices with `knowledge decide` as you make them, not at session end.** Each decision is embedded — `knowledge resume` surfaces the latest five every new session, and `knowledge decisions --search "<topic>"` finds older ones. A two-minute `decide` call today saves a 20-minute "why did we do this" excavation next week.
+
+## Auto-maintenance — run BEFORE any query verb
 
 ```bash
 knowledge status --json
 ```
 
-Reads the `state` field from the JSON: one of `missing`, `stale`, `fresh`. Exit codes are also usable (2, 1, 0 respectively) — whichever is handier.
+Branch on `state`:
+- `missing` → `knowledge build` (first-time: 1–5 min for embedding model + initial encode; warn the user).
+- `stale`   → `knowledge update` (usually <5s; only re-embeds chunks whose sanitized text changed).
+- `fresh`   → go straight to your query verb.
 
-### 2. Build or update as needed
+## The six agent-speed verbs
 
-- `state: missing` → index doesn't exist for this repo yet. Run `knowledge build` and warn the user that first-time indexing takes 1-5 minutes (mostly embedding model load + initial encode).
-- `state: stale` → files changed since last index. Run `knowledge update` silently (usually finishes in under 5s; only re-embeds chunks whose post-sanitize text actually changed).
-- `state: fresh` → skip, go straight to search.
+These bypass the embedding model entirely (`find`, `grep`) or cache their answers (`ask`). Prefer them over reading raw files for meaning questions.
 
-### 3. Run the search
+### `find <name>` — exact/prefix/regex symbol lookup
+
+```bash
+knowledge find VaultClient --exact          # SQL equality on name / qualified_name
+knowledge find regen --kind ansible_task    # prefix (default), filtered to Ansible tasks
+knowledge find '^handle_' --regex           # Python regex — use flags like (?i) for case
+```
+
+Under 10ms. Use when you know a symbol name and want its source location.
+
+### `grep <pattern>` — FTS5 full-text match
+
+```bash
+knowledge grep 'helm install'
+knowledge grep '"exact phrase"'                # phrase search
+knowledge grep 'vault AND approle'             # boolean
+knowledge grep 'name:VaultClient'              # column qualifier
+knowledge grep 'regenerate*' --kind ansible_task
+```
+
+Full FTS5 query syntax. Tokens-only index (no embedder). Use for lexical precision.
+
+### `ask <question>` — hybrid semantic + lexical (the default)
+
+```bash
+knowledge ask "how does vault auto_load inject secrets"
+knowledge ask "octavia LB floating IP" --top-k 5
+knowledge ask "cert regen" --budget 2000           # soft token budget for citation list
+knowledge ask "<question>" --no-cache              # force fresh (skip 1h cache)
+```
+
+RRF merge of vec + FTS, reranked by last-30d git, current session stage, and import-graph hub in-degree. Cached per (query, HEAD sha) with 1h TTL; invalidated in the same txn whenever the indexer mutates a chunk.
+
+### `why <path>` — one-file brief
+
+```bash
+knowledge why ansible/roles/karmada/tasks/main.yml
+knowledge why python_packages/kickstart/utils.py
+```
+
+Returns: lang/loc/last-commit-date, first description line, top 5 symbols by size, top 3 inbound + outbound edges. ~100ms. Use to orient on a file before reading it.
+
+### `map [--dir PATH] [--depth N]` — directory overview
+
+```bash
+knowledge map --depth 2                     # whole repo
+knowledge map --dir terraform --depth 3     # one subtree
+```
+
+Per-dir: file count, dominant language, top 3 non-structural chunk kinds, highest-in-degree "entrypoint" file. Truncates at 200 rows.
+
+### `brief` — repo-wide snapshot
+
+```bash
+knowledge brief
+```
+
+Totals, top 5 langs, top 10 hub files by in-degree. Run once on unfamiliar repos to build a mental model before asking specific questions.
+
+## Session memory — `decide` + `resume`
+
+See the priority directives above. Full detail:
+
+### `decide` — record a non-obvious choice
+
+```bash
+knowledge decide "cache invalidation" \
+  --decision "wipe per-project on any chunk change; preserve on no-op update" \
+  --rationale "agent-driven updates on every turn shouldn't thrash cache" \
+  --files knowledge/query_cache.py knowledge/indexer.py
+```
+
+Topic + decision are the keys. Rationale and file list are optional but valuable — the rationale is what future-you actually needs to remember.
+
+### `decisions` — list or semantically search
+
+```bash
+knowledge decisions --limit 5
+knowledge decisions --topic cache              # substring filter on topic
+knowledge decisions --search "how to handle stale caches"   # semantic over topic+decision
+```
+
+### `resume` — the session-start brief
+
+```bash
+knowledge resume
+```
+
+Four blocks in order: last 5 decisions, 10 most-touched files (7d), un-ingested stage entries, top 3 hub files. ~1200 tokens, idempotent. Run first on every new session.
+
+## `search` — raw-chunks flow (legacy / specialist use)
+
+Kept for when you need ranked vector results without RRF/rerank/cache — e.g. comparing distances, piping to downstream code, or debugging retrieval.
 
 ```bash
 knowledge search "$ENRICHED_QUERY" [--kind K] [--lang L] [--top-k 10]
 ```
+
+For normal agent use, prefer `ask`.
 
 ## Query enrichment — rewrite the user's question before searching
 
@@ -96,16 +197,21 @@ knowledge path <chunk_id>                      # file_path:start_line-end_line
 
 User: "how does the karmada cert regeneration ansible task work"
 
-1. `knowledge status --json` → `{"state": "fresh", ...}` → no maintenance needed
-2. Rewrite to `ansible task: karmada cert regeneration`
-3. `knowledge search "ansible task: karmada cert regeneration" --kind ansible_task --top-k 5`
-4. Top result: `Regenerate Karmada TLS certificates (ansible/roles/karmada/tasks/main.yml:47-55)` with `chunk_id=682`
-5. Optionally `knowledge get 682 --raw` to show the original YAML
-6. Summarize for the user referencing `ansible/roles/karmada/tasks/main.yml:47`
+1. New session → `knowledge resume` to load prior context.
+2. `knowledge status --json` → `{"state": "fresh", ...}` → no maintenance needed
+3. `knowledge ask "karmada cert regeneration" --kind ansible_task --top-k 5`
+4. Top result: `ansible/roles/karmada/tasks/main.yml:47-55 | ansible_task | name: Regenerate Karmada TLS certificates`
+5. `knowledge why ansible/roles/karmada/tasks/regenerate_certs.yml` for the included file's neighbors.
+6. Summarize for the user referencing `ansible/roles/karmada/tasks/main.yml:47`.
+7. If this invoked a non-obvious design choice, `knowledge decide "karmada cert rotation approach" --decision "..." --files ansible/roles/karmada/tasks/regenerate_certs.yml`.
 
 ## Continuity / memory — cross-session RAG over past work
 
-Alongside code chunks, this tool stores per-project **work summaries** (short + long pairs) so a new session can pick up where the last one left off without re-reading the prior transcript. Two-tier retrieval: semantic search over short summaries, drill into the long summary of a specific hit when details are needed.
+Two complementary stores:
+- **History** (`knowledge history stage|ingest|recent|search`) — free-form work summaries keyed by session/time. Good for "what did we do last Tuesday."
+- **Decisions** (`knowledge decide|decisions|resume`) — structured choices with topic/decision/rationale/files. Good for "why did we pick X over Y."
+
+Use **history** for narrative, **decisions** for commitments. `resume` aggregates both plus git and staging state into one session-start brief.
 
 ### Session start — check what we did before
 

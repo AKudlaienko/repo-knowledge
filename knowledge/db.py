@@ -106,6 +106,13 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_chunks_file    ON chunks(file_id)",
     "CREATE INDEX IF NOT EXISTS idx_chunks_parent  ON chunks(parent_id, sibling_order)",
     "CREATE INDEX IF NOT EXISTS idx_chunks_hash    ON chunks(content_hash)",
+    # Partial indexes for exact-name lookup (schema v2). `knowledge find`
+    # hits these for O(log n) lookups — anonymous chunks (markdown
+    # sections, shell blocks) skip the index entirely.
+    "CREATE INDEX IF NOT EXISTS idx_chunks_name  ON chunks(project_id, name) "
+    "WHERE name IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_chunks_qname ON chunks(project_id, qualified_name) "
+    "WHERE qualified_name IS NOT NULL",
     """
     CREATE TABLE IF NOT EXISTS history (
         id            INTEGER PRIMARY KEY,
@@ -160,6 +167,44 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_project_variables "
     "ON project_variables(project_id, scope)",
+    # query_cache (schema v2): per-project, per-HEAD-sha answer cache for
+    # `knowledge ask`. Keyed by (project_id, query_hash, head_sha); the
+    # hash already includes schema_version so v2→v3 upgrades invalidate
+    # automatically. TTL 1h on expires_at. Invalidated in bulk on
+    # build/update when ≥1 chunk changes (see indexer.py).
+    """
+    CREATE TABLE IF NOT EXISTS query_cache (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        query_hash  TEXT    NOT NULL,
+        head_sha    TEXT    NOT NULL,
+        result_json TEXT    NOT NULL,
+        created_at  REAL    NOT NULL,
+        expires_at  REAL    NOT NULL,
+        UNIQUE(project_id, query_hash, head_sha)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_query_cache_exp ON query_cache(expires_at)",
+    # decisions (schema v2): durable record of non-obvious choices made
+    # during sessions. Complements `history` (one entry per unit of work)
+    # with structured fields that make "what did we decide about X?"
+    # answerable without parsing prose. `files_touched` is a JSON array
+    # of rel_paths — not a FK table because most queries are "give me
+    # everything" rather than "which decisions touched file Y".
+    """
+    CREATE TABLE IF NOT EXISTS decisions (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        created_at    REAL    NOT NULL,
+        topic         TEXT    NOT NULL,
+        decision      TEXT    NOT NULL,
+        rationale     TEXT,
+        files_touched TEXT,
+        session_id    TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_decisions_proj_time "
+    "ON decisions(project_id, created_at DESC)",
 )
 
 
@@ -187,6 +232,78 @@ def init_schema(conn: Connection) -> None:
         )
         """
     )
+    # decisions_vec (schema v2): embeds ``topic || ' :: ' || decision``.
+    # Same shape as history_vec — cheap semantic search for "what did we
+    # decide about X?".
+    conn.execute(
+        f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS decisions_vec USING vec0(
+            decision_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{config.EMBEDDING_DIM}]
+        )
+        """
+    )
+
+    # chunks_fts (schema v2): FTS5 over chunk symbol names + stored_text
+    # for `knowledge grep`. Contentless (`content=''`) — we don't need
+    # highlight()/snippet(), just MATCH-for-rowid, so tokens-only halves
+    # the disk footprint vs storing a copy of stored_text.
+    #
+    # Triggers keep the FTS in sync with chunks. Contentless FTS5 DELETE
+    # requires the OLD content via the special 'delete' command — trivial
+    # from AFTER DELETE / AFTER UPDATE triggers which have OLD.* available,
+    # awkward to replicate as explicit indexer calls.
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            name,
+            qualified_name,
+            stored_text,
+            content=''
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, name, qualified_name, stored_text)
+            VALUES (new.id, new.name, new.qualified_name, new.stored_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, name, qualified_name, stored_text)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.stored_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, name, qualified_name, stored_text)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.stored_text);
+            INSERT INTO chunks_fts(rowid, name, qualified_name, stored_text)
+            VALUES (new.id, new.name, new.qualified_name, new.stored_text);
+        END
+        """
+    )
+
+    # v1 → v2 migration backfill. Contentless FTS5 `'delete'` commands require
+    # the OLD content to match what was indexed; feeding the trigger OLD rows
+    # that were never inserted into the FTS corrupts the index. On fresh v2
+    # DBs this branch is a no-op (both tables empty). On upgraded DBs it
+    # populates FTS once, so the first post-upgrade rebuild's DELETE triggers
+    # operate against consistent state. Guarded so we don't re-pay the cost
+    # on every connect.
+    fts_count = conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+    chunks_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    if chunks_count > 0 and fts_count == 0:
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, name, qualified_name, stored_text) "
+            "SELECT id, name, qualified_name, stored_text FROM chunks"
+        )
 
     # Seed versions on first run. APSW auto-commits outside of explicit
     # transaction blocks, so these INSERTs are durable immediately.
