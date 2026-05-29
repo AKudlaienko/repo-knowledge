@@ -22,7 +22,7 @@ import json
 import time
 from typing import NamedTuple
 
-from . import config
+from . import config, db
 from .db import Connection
 from .embedder import get_embedder
 
@@ -63,27 +63,25 @@ def add(
     vec = get_embedder().encode([text_to_embed])[0]
     files_json = json.dumps(files_touched) if files_touched else None
 
-    with conn:
+    with db.transaction(conn):
         now = time.time()
-        conn.execute(
+        new_id = db.execute_returning_id(
+            conn,
             "INSERT INTO decisions("
             "project_id, created_at, topic, decision, rationale, "
             "files_touched, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (project_id, now, topic, decision, rationale, files_json, session_id),
         )
-        new_id = conn.last_insert_rowid()
-        conn.execute(
-            "INSERT INTO decisions_vec(decision_id, embedding) VALUES (?, ?)",
-            (new_id, vec.tobytes()),
-        )
+        db.insert_decision_embedding(conn, new_id, vec)
     return new_id
 
 
 def get(conn: Connection, decision_id: int) -> Decision | None:
-    row = conn.execute(
+    row = db.fetch_one(
+        conn,
         f"SELECT {_SELECT_COLS} FROM decisions WHERE id = ?",
         (decision_id,),
-    ).fetchone()
+    )
     return _row_to_decision(row) if row else None
 
 
@@ -108,16 +106,23 @@ def recent(
         where.append("created_at >= ?")
         params.append(time.time() - days * 86400)
     if topic:
-        where.append("topic LIKE ? COLLATE NOCASE")
+        # SQLite LIKE is case-insensitive only with ASCII ``COLLATE
+        # NOCASE``; PG needs ``ILIKE``. Both accept ``%foo%`` substring
+        # syntax so the parameter shape is identical.
+        if db.current_mode() == "postgresql":
+            where.append("topic ILIKE ?")
+        else:
+            where.append("topic LIKE ? COLLATE NOCASE")
         params.append(f"%{topic}%")
 
     extra = ("WHERE " + " AND ".join(where)) if where else ""
     params.append(limit)
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         f"SELECT {_SELECT_COLS} FROM decisions {extra} "
         f"ORDER BY created_at DESC LIMIT ?",
-        params,
-    ).fetchall()
+        tuple(params),
+    )
     return [_row_to_decision(r) for r in rows]
 
 
@@ -132,15 +137,40 @@ def search(
     """
     q_vec = get_embedder().encode([query])[0]
     k_fetch = top_k * 3 if project_id is not None else top_k
+    cols_prefixed = ", ".join("d." + c for c in _SELECT_COLS.split(", "))
 
-    where_clauses: list[str] = []
-    params: list = [q_vec.tobytes(), k_fetch]
+    if db.current_mode() == "postgresql":
+        where_clauses: list[str] = []
+        filter_params: list = []
+        if project_id is not None:
+            where_clauses.append("d.project_id = %s")
+            filter_params.append(project_id)
+        extra_where = (
+            "AND " + " AND ".join(where_clauses) if where_clauses else ""
+        )
+        sql = f"""
+            SELECT {cols_prefixed}, (e.embedding <=> %s) AS distance
+            FROM decision_embeddings e
+            JOIN decisions d ON d.id = e.decision_id
+            WHERE TRUE {extra_where}
+            ORDER BY e.embedding <=> %s
+            LIMIT %s
+        """
+        # SQL placeholder order: distance projection, filter clauses,
+        # ORDER BY operand, LIMIT.
+        params = [q_vec, *filter_params, q_vec, top_k]
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [(_row_to_decision(r[:-1]), float(r[-1])) for r in rows]
+
+    # SQLite path — sqlite-vec virtual table.
+    where_clauses = []
+    params = [q_vec.tobytes(), k_fetch]
     if project_id is not None:
         where_clauses.append("d.project_id = ?")
         params.append(project_id)
     extra_where = ("AND " + " AND ".join(where_clauses)) if where_clauses else ""
-
-    cols_prefixed = ", ".join("d." + c for c in _SELECT_COLS.split(", "))
     sql = f"""
         SELECT {cols_prefixed}, v.distance
         FROM decisions_vec v

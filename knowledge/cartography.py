@@ -21,6 +21,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import db
 from .db import Connection
 
 
@@ -65,10 +66,11 @@ def why(
     neighbors_n: int = 3,
 ) -> FileBrief | None:
     """Return a :class:`FileBrief` for ``rel_path``, or None if not indexed."""
-    file_row = conn.execute(
+    file_row = db.fetch_one(
+        conn,
         "SELECT id, lang, size FROM files WHERE project_id = ? AND rel_path = ?",
         (project_id, rel_path),
-    ).fetchone()
+    )
     if file_row is None:
         return None
     file_id, lang, size = file_row
@@ -133,10 +135,11 @@ def map_tree(
         where.append("(rel_path = ? OR rel_path LIKE ?)")
         params.extend([prefix, f"{prefix}/%"])
 
-    files = conn.execute(
+    files = db.fetch_all(
+        conn,
         f"SELECT id, rel_path, lang FROM files WHERE {' AND '.join(where)}",
-        params,
-    ).fetchall()
+        tuple(params),
+    )
 
     # Bucket files by dir key. Root-level files (no "/") use "" as the key.
     # depth=N keeps the first N components — "a/b/c/d.py" at depth=2 → "a/b".
@@ -185,37 +188,40 @@ def brief(
     last_updated: float | None,
 ) -> RepoBrief:
     """Repo-level snapshot. Single pass over each table, no joins needed."""
-    file_count = conn.execute(
-        "SELECT COUNT(*) FROM files WHERE project_id = ?", (project_id,)
-    ).fetchone()[0]
-    chunk_count = conn.execute(
-        "SELECT COUNT(*) FROM chunks WHERE project_id = ?", (project_id,)
-    ).fetchone()[0]
-    edge_count = conn.execute(
-        "SELECT COUNT(*) FROM file_edges WHERE project_id = ?", (project_id,)
-    ).fetchone()[0]
+    file_count = db.fetch_one(
+        conn, "SELECT COUNT(*) FROM files WHERE project_id = ?", (project_id,)
+    )[0]
+    chunk_count = db.fetch_one(
+        conn, "SELECT COUNT(*) FROM chunks WHERE project_id = ?", (project_id,)
+    )[0]
+    edge_count = db.fetch_one(
+        conn, "SELECT COUNT(*) FROM file_edges WHERE project_id = ?", (project_id,)
+    )[0]
 
-    top_langs = conn.execute(
+    top_langs_rows = db.fetch_all(
+        conn,
         "SELECT lang, COUNT(*) AS n FROM files WHERE project_id = ? "
         "GROUP BY lang ORDER BY n DESC LIMIT 5",
         (project_id,),
-    ).fetchall()
-    top_langs = [(r[0], r[1]) for r in top_langs]
+    )
+    top_langs = [(r[0], r[1]) for r in top_langs_rows]
 
     # Hub files = highest in-degree (most-referenced by others). Filters out
-    # NULL target_file_id (external / unresolved edges).
-    hub_rows = conn.execute(
+    # NULL target_file_id (external / unresolved edges). f.rel_path included
+    # in GROUP BY for PostgreSQL strictness (sqlite is lenient).
+    hub_rows = db.fetch_all(
+        conn,
         """
         SELECT f.rel_path, COUNT(*) AS in_degree
         FROM file_edges e
         JOIN files f ON f.id = e.target_file_id
         WHERE e.project_id = ? AND e.target_file_id IS NOT NULL
-        GROUP BY e.target_file_id
+        GROUP BY e.target_file_id, f.rel_path
         ORDER BY in_degree DESC, f.rel_path ASC
         LIMIT 10
         """,
         (project_id,),
-    ).fetchall()
+    )
     hub_files = [(r[0], r[1]) for r in hub_rows]
 
     return RepoBrief(
@@ -249,12 +255,13 @@ def _extract_description(conn: Connection, file_id: int) -> str | None:
     """
     # Try module_level chunks first (Python). They include the file's
     # top-level docstring if present.
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         "SELECT kind, stored_text FROM chunks "
         "WHERE file_id = ? AND kind IN ('module_level', 'markdown_section') "
         "ORDER BY start_line ASC LIMIT 3",
         (file_id,),
-    ).fetchall()
+    )
 
     for kind, stored in rows:
         desc = _first_meaningful_line(stored, kind)
@@ -262,12 +269,13 @@ def _extract_description(conn: Connection, file_id: int) -> str | None:
             return desc
 
     # Fallback: any chunk at line 1.
-    row = conn.execute(
+    row = db.fetch_one(
+        conn,
         "SELECT stored_text FROM chunks "
         "WHERE file_id = ? AND start_line <= 3 "
         "ORDER BY start_line ASC LIMIT 1",
         (file_id,),
-    ).fetchone()
+    )
     if row:
         return _first_meaningful_line(row[0], None)
     return None
@@ -335,7 +343,8 @@ def _top_symbols(
     nothing to display.
     """
     placeholders = ",".join("?" * len(_NON_SYMBOL_KINDS))
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         f"""
         SELECT kind,
                COALESCE(qualified_name, name) AS display_name,
@@ -348,7 +357,7 @@ def _top_symbols(
         LIMIT ?
         """,
         (file_id, *_NON_SYMBOL_KINDS, n),
-    ).fetchall()
+    )
     return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
 
@@ -357,9 +366,9 @@ def _file_loc(conn: Connection, file_id: int) -> int:
 
     Files with no chunks return 0 — fine; we're not claiming byte-exact LOC.
     """
-    row = conn.execute(
-        "SELECT MAX(end_line) FROM chunks WHERE file_id = ?", (file_id,)
-    ).fetchone()
+    row = db.fetch_one(
+        conn, "SELECT MAX(end_line) FROM chunks WHERE file_id = ?", (file_id,)
+    )
     return int(row[0] or 0)
 
 
@@ -389,7 +398,8 @@ def _inbound_neighbors(
     conn: Connection, file_id: int, n: int
 ) -> list[tuple[str, str]]:
     """Top-N files that reference this file. ``(source_rel_path, edge_kind)``."""
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         """
         SELECT f.rel_path, e.kind
         FROM file_edges e
@@ -399,7 +409,7 @@ def _inbound_neighbors(
         LIMIT ?
         """,
         (file_id, n),
-    ).fetchall()
+    )
     return [(r[0], r[1]) for r in rows]
 
 
@@ -407,7 +417,8 @@ def _outbound_neighbors(
     conn: Connection, file_id: int, n: int
 ) -> list[tuple[str, str]]:
     """Top-N files this file references (target not NULL). ``(target_rel_path, kind)``."""
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         """
         SELECT f.rel_path, e.kind
         FROM file_edges e
@@ -417,7 +428,7 @@ def _outbound_neighbors(
         LIMIT ?
         """,
         (file_id, n),
-    ).fetchall()
+    )
     return [(r[0], r[1]) for r in rows]
 
 
@@ -446,7 +457,8 @@ def _build_dir_entry(
     # Top 3 non-structural chunk kinds in this bucket.
     placeholders_ids = ",".join("?" * len(file_ids))
     placeholders_kinds = ",".join("?" * len(_NON_SYMBOL_KINDS))
-    kind_rows = conn.execute(
+    kind_rows = db.fetch_all(
+        conn,
         f"""
         SELECT kind, COUNT(*) AS n FROM chunks
         WHERE file_id IN ({placeholders_ids})
@@ -454,22 +466,24 @@ def _build_dir_entry(
         GROUP BY kind ORDER BY n DESC LIMIT 3
         """,
         (*file_ids, *_NON_SYMBOL_KINDS),
-    ).fetchall()
+    )
     top_kinds = [(r[0], r[1]) for r in kind_rows]
 
     # Highest in-degree file in this bucket → "the one to read first".
-    entry_row = conn.execute(
+    # f.rel_path in GROUP BY for PG strictness.
+    entry_row = db.fetch_one(
+        conn,
         f"""
         SELECT f.rel_path, COUNT(*) AS in_degree
         FROM file_edges e
         JOIN files f ON f.id = e.target_file_id
         WHERE e.target_file_id IN ({placeholders_ids})
-        GROUP BY e.target_file_id
+        GROUP BY e.target_file_id, f.rel_path
         ORDER BY in_degree DESC, f.rel_path ASC
         LIMIT 1
         """,
-        file_ids,
-    ).fetchone()
+        tuple(file_ids),
+    )
     entrypoint = entry_row[0] if entry_row else None
 
     return DirEntry(

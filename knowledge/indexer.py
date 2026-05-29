@@ -55,22 +55,32 @@ def build_project(
 ) -> tuple[int, int, int]:
     """Full rebuild. Returns ``(project_id, file_count, chunk_count)``."""
     project = get_or_create_project(conn, root, name_override)
+    backend = db.get_backend()
 
-    with conn:  # APSW: outer savepoint = one atomic transaction
+    with db.transaction(conn):
+        # On PG: non-blocking advisory lock so two concurrent build/update
+        # runs against the same project on the same server fail-fast
+        # (exit code 3 from the CLI) instead of stacking up. SQLite is a
+        # no-op — single-writer journal already serializes.
+        if not backend.try_advisory_lock_project(conn, project.id):
+            raise db.ProjectBusyError(project.name)
+
         # Any prior `ask` answer for this project is stale after a full
         # rebuild — chunk IDs / file paths may change. Wipe within the
         # same txn so cache state stays consistent with chunk state.
         query_cache.wipe_project(conn, project.id)
 
-        # Clean slate for this project. chunks_vec has no FK cascade (virtual
-        # table), so we clear it first before chunks drops the ids it refs.
-        conn.execute(
-            "DELETE FROM chunks_vec WHERE chunk_id IN "
-            "(SELECT id FROM chunks WHERE project_id = ?)",
-            (project.id,),
+        # Clean slate for this project. SQLite vec0 has no FK cascade so
+        # the helper wipes chunks_vec rows explicitly before chunks goes;
+        # the PG side table cascades from ``chunks`` so the helper is a
+        # no-op there.
+        db.delete_chunk_embeddings_for_project(conn, project.id)
+        db.execute(
+            conn, "DELETE FROM chunks WHERE project_id = ?", (project.id,)
         )
-        conn.execute("DELETE FROM chunks WHERE project_id = ?", (project.id,))
-        conn.execute("DELETE FROM files WHERE project_id = ?", (project.id,))
+        db.execute(
+            conn, "DELETE FROM files WHERE project_id = ?", (project.id,)
+        )
 
         # Buffer for batch embedding: (chunk_id, embedded_text) pairs.
         embed_queue: list[tuple[int, str]] = []
@@ -102,12 +112,12 @@ def build_project(
             # no chunks (empty YAML, ``{}`` JSON, empty stub scripts). If
             # we skip it, subsequent `update` runs keep classifying the
             # file as "new" and re-scan it forever.
-            conn.execute(
+            file_id = db.execute_returning_id(
+                conn,
                 "INSERT INTO files(project_id, rel_path, content_hash, mtime, "
                 "size, lang, last_scanned) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (project.id, rel, content_hash, stat.st_mtime, stat.st_size, lang, now),
             )
-            file_id = conn.last_insert_rowid()
             files_indexed += 1
 
             # Edge extraction runs regardless of chunker output — a file
@@ -134,7 +144,8 @@ def build_project(
                 )
                 metadata_json = json.dumps(c.metadata) if c.metadata else None
 
-                conn.execute(
+                cid = db.execute_returning_id(
+                    conn,
                     "INSERT INTO chunks(project_id, file_id, parent_id, "
                     "sibling_order, kind, name, qualified_name, start_line, "
                     "end_line, start_byte, end_byte, char_count, content_hash, "
@@ -147,7 +158,6 @@ def build_project(
                         len(stored), chunk_hash, stored, stored, metadata_json,
                     ),
                 )
-                cid = conn.last_insert_rowid()
                 inserted_ids.append(cid)
                 embed_queue.append((cid, stored))
 
@@ -159,10 +169,7 @@ def build_project(
             texts = [t for (_, t) in embed_queue]
             vectors = embedder.encode(texts)
             for (cid, _), vec in zip(embed_queue, vectors):
-                conn.execute(
-                    "INSERT INTO chunks_vec(chunk_id, embedding) VALUES (?, ?)",
-                    (cid, vec.tobytes()),
-                )
+                db.insert_chunk_embedding(conn, cid, vec)
 
         # Resolve + persist edges. Deferred to here so forward references
         # (A imports B, where A is walked before B) resolve against the
@@ -172,7 +179,8 @@ def build_project(
             if verbose:
                 print(f"edges: {edge_count} across {len(pending_edges)} files")
 
-        conn.execute(
+        db.execute(
+            conn,
             "UPDATE projects SET last_build = ?, last_update = ? WHERE id = ?",
             (now, now, project.id),
         )
@@ -230,10 +238,11 @@ def update_project(
     # Map existing files by rel_path for O(1) per-path lookup.
     existing_files: dict[str, tuple[int, str]] = {
         row[1]: (row[0], row[2])
-        for row in conn.execute(
+        for row in db.fetch_all(
+            conn,
             "SELECT id, rel_path, content_hash FROM files WHERE project_id = ?",
             (project.id,),
-        ).fetchall()
+        )
     }
 
     # One-time backfill: a project indexed before the relations feature
@@ -244,10 +253,11 @@ def update_project(
     # those whose bytes are unchanged.
     needs_edge_backfill = False
     if existing_files:
-        edge_count = conn.execute(
+        edge_count = db.fetch_one(
+            conn,
             "SELECT COUNT(*) FROM file_edges WHERE project_id = ?",
             (project.id,),
-        ).fetchone()[0]
+        )[0]
         if edge_count == 0:
             needs_edge_backfill = True
             if verbose:
@@ -267,7 +277,11 @@ def update_project(
     files_new = 0
     now = time.time()
 
-    with conn:
+    backend = db.get_backend()
+    with db.transaction(conn):
+        if not backend.try_advisory_lock_project(conn, project.id):
+            raise db.ProjectBusyError(project.name)
+
         for abs_path, lang in walk_project(root):
             rel = abs_path.relative_to(root).as_posix()
             seen_paths.add(rel)
@@ -292,7 +306,8 @@ def update_project(
                     # it so `status` doesn't flag this file as stale
                     # forever. Without this, status stays red after a
                     # successful update.
-                    conn.execute(
+                    db.execute(
+                        conn,
                         "UPDATE files SET mtime = ?, last_scanned = ? "
                         "WHERE id = ?",
                         (stat.st_mtime, now, file_id),
@@ -329,12 +344,17 @@ def update_project(
         files_deleted = len(stale_paths)
         for rel in stale_paths:
             file_id, _ = existing_files[rel]
-            conn.execute(
-                "DELETE FROM chunks_vec WHERE chunk_id IN "
-                "(SELECT id FROM chunks WHERE file_id = ?)",
-                (file_id,),
-            )
-            conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            # SQLite path: drop chunks_vec rows for this file's chunks
+            # before the chunks themselves go (vec0 has no FK cascade).
+            # PG path: chunk_embeddings.chunk_id cascades from chunks,
+            # which in turn cascades from files — nothing to do here.
+            if db.current_mode() == "sqlite":
+                conn.execute(
+                    "DELETE FROM chunks_vec WHERE chunk_id IN "
+                    "(SELECT id FROM chunks WHERE file_id = ?)",
+                    (file_id,),
+                )
+            db.execute(conn, "DELETE FROM files WHERE id = ?", (file_id,))
             # files cascade-deletes chunks AND file_edges (ON DELETE CASCADE)
 
         # Batch-embed just the chunks that were actually new/changed.
@@ -345,10 +365,7 @@ def update_project(
             texts = [t for (_, t) in embed_queue]
             vectors = embedder.encode(texts)
             for (cid, _), vec in zip(embed_queue, vectors):
-                conn.execute(
-                    "INSERT INTO chunks_vec(chunk_id, embedding) VALUES (?, ?)",
-                    (cid, vec.tobytes()),
-                )
+                db.insert_chunk_embedding(conn, cid, vec)
 
         # Flush edges after the whole walk so forward references resolve
         # against the final files table. Unchanged files keep their
@@ -361,7 +378,8 @@ def update_project(
                     f"file(s) changed/added"
                 )
 
-        conn.execute(
+        db.execute(
+            conn,
             "UPDATE projects SET last_update = ? WHERE id = ?",
             (now, project.id),
         )
@@ -408,12 +426,12 @@ def _insert_new_file(
 
     # File row always goes in, even for zero-chunk files. Prevents the
     # "perpetually new" loop where empty files get rescanned every update.
-    conn.execute(
+    file_id = db.execute_returning_id(
+        conn,
         "INSERT INTO files(project_id, rel_path, content_hash, mtime, "
         "size, lang, last_scanned) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (project_id, rel, content_hash, stat.st_mtime, stat.st_size, lang, now),
     )
-    file_id = conn.last_insert_rowid()
 
     # Collect edges whether or not the file chunks. Edge resolution
     # happens in a later pass against the final files table.
@@ -430,7 +448,8 @@ def _insert_new_file(
         parent_id = (
             inserted_ids[c.parent_idx] if c.parent_idx is not None else None
         )
-        conn.execute(
+        cid = db.execute_returning_id(
+            conn,
             "INSERT INTO chunks(project_id, file_id, parent_id, sibling_order, "
             "kind, name, qualified_name, start_line, end_line, start_byte, end_byte, "
             "char_count, content_hash, stored_text, embedded_text, metadata) "
@@ -442,7 +461,6 @@ def _insert_new_file(
                 len(stored), chunk_hash, stored, stored, metadata_json,
             ),
         )
-        cid = conn.last_insert_rowid()
         inserted_ids.append(cid)
         embed_queue.append((cid, stored))
 
@@ -481,10 +499,11 @@ def _reindex_changed_file(
     # Map existing chunks by content_hash. Dup hashes (two identical
     # functions in one file) stack into a list; pop off as we reuse.
     existing_by_hash: dict[str, list[int]] = {}
-    for cid, ch in conn.execute(
+    for cid, ch in db.fetch_all(
+        conn,
         "SELECT id, content_hash FROM chunks WHERE file_id = ?",
         (file_id,),
-    ).fetchall():
+    ):
         existing_by_hash.setdefault(ch, []).append(cid)
 
     processed_ids: list[int] = []
@@ -501,7 +520,8 @@ def _reindex_changed_file(
 
         if reused_id is not None:
             # Keep embedding; only refresh positional + parent fields.
-            conn.execute(
+            db.execute(
+                conn,
                 "UPDATE chunks SET parent_id=?, sibling_order=?, "
                 "start_line=?, end_line=?, start_byte=?, end_byte=?, "
                 "name=?, qualified_name=?, metadata=? WHERE id=?",
@@ -513,7 +533,8 @@ def _reindex_changed_file(
             )
             processed_ids.append(reused_id)
         else:
-            conn.execute(
+            cid = db.execute_returning_id(
+                conn,
                 "INSERT INTO chunks(project_id, file_id, parent_id, sibling_order, "
                 "kind, name, qualified_name, start_line, end_line, start_byte, end_byte, "
                 "char_count, content_hash, stored_text, embedded_text, metadata) "
@@ -525,25 +546,24 @@ def _reindex_changed_file(
                     len(stored), chunk_hash, stored, stored, metadata_json,
                 ),
             )
-            cid = conn.last_insert_rowid()
             processed_ids.append(cid)
             embed_queue.append((cid, stored))
 
-    # Delete leftover existing chunks that weren't reused.
+    # Delete leftover existing chunks that weren't reused. SQLite needs an
+    # explicit chunks_vec sweep first; PG cascades from the chunks DELETE.
     orphan_ids = [cid for ids in existing_by_hash.values() for cid in ids]
     if orphan_ids:
+        db.delete_chunk_embeddings_by_ids(conn, orphan_ids)
         placeholders = ",".join("?" * len(orphan_ids))
-        conn.execute(
-            f"DELETE FROM chunks_vec WHERE chunk_id IN ({placeholders})",
-            orphan_ids,
-        )
-        conn.execute(
+        db.execute(
+            conn,
             f"DELETE FROM chunks WHERE id IN ({placeholders})",
-            orphan_ids,
+            tuple(orphan_ids),
         )
 
     # Refresh the files row with the new bytes-hash + mtime.
-    conn.execute(
+    db.execute(
+        conn,
         "UPDATE files SET content_hash=?, mtime=?, size=?, last_scanned=? "
         "WHERE id=?",
         (content_hash, stat.st_mtime, stat.st_size, now, file_id),
@@ -560,19 +580,30 @@ def _prepare_chunk_row(c: Chunk) -> tuple[str, str, str | None]:
 
 
 def _version_mismatches(conn: Connection) -> list[str]:
-    """Return meta keys whose stored value differs from current config.
+    """Return meta keys whose stored value DIFFERS from current config.
 
     Returning an empty list means the index's chunker/model/schema are
     compatible with the code in this process and incremental update is
     safe. Any mismatch means chunks stored under an older chunker have
     stale semantics (different embeddings, different chunk boundaries).
+
+    Missing keys (``get_meta`` returns ``None``) are *not* a mismatch —
+    on shared_postgresql, the ``meta`` table is freshly seeded by the
+    first ``build`` to run; freshly-migrated projects have no meta until
+    the first build/update writes it. Treating missing as "different"
+    would force a destructive rebuild on every PG migration.
     """
     wanted = {
         "schema_version":  config.SCHEMA_VERSION,
         "chunker_version": config.CHUNKER_VERSION,
         "embedding_model": config.MODEL,
     }
-    return [k for k, v in wanted.items() if db.get_meta(conn, k) != v]
+    out: list[str] = []
+    for k, v in wanted.items():
+        stored = db.get_meta(conn, k)
+        if stored is not None and stored != v:
+            out.append(k)
+    return out
 
 
 def _flush_edges(

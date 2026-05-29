@@ -27,7 +27,7 @@ import subprocess
 from functools import lru_cache
 from pathlib import Path
 
-from . import config, fts, paths, query_cache, search
+from . import config, db, fts, paths, query_cache, search
 from .db import Connection
 from .search import SearchResult
 
@@ -231,7 +231,8 @@ def _in_degrees(
     if not rel_paths:
         return {}
     placeholders = ",".join("?" * len(rel_paths))
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         f"""
         SELECT f.rel_path, COUNT(*) AS d
         FROM file_edges e
@@ -239,10 +240,10 @@ def _in_degrees(
         WHERE e.project_id = ?
           AND e.target_file_id IS NOT NULL
           AND f.rel_path IN ({placeholders})
-        GROUP BY e.target_file_id
+        GROUP BY e.target_file_id, f.rel_path
         """,
         (project_id, *rel_paths),
-    ).fetchall()
+    )
     return {r[0]: r[1] for r in rows}
 
 

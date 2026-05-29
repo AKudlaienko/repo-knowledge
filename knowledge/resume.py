@@ -25,7 +25,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import decisions as decisions_mod
+from . import db, decisions as decisions_mod
 from . import history, paths
 from .db import Connection
 
@@ -76,12 +76,12 @@ def build(
     pending = _pending_stage_entries(project_root)
     hubs = _hub_files(conn, project_id, _HUB_N)
 
-    total_history = conn.execute(
-        "SELECT COUNT(*) FROM history WHERE project_id = ?", (project_id,)
-    ).fetchone()[0]
-    total_decisions = conn.execute(
-        "SELECT COUNT(*) FROM decisions WHERE project_id = ?", (project_id,)
-    ).fetchone()[0]
+    total_history = db.fetch_one(
+        conn, "SELECT COUNT(*) FROM history WHERE project_id = ?", (project_id,)
+    )[0]
+    total_decisions = db.fetch_one(
+        conn, "SELECT COUNT(*) FROM decisions WHERE project_id = ?", (project_id,)
+    )[0]
 
     return ResumeBrief(
         project_name=project_name,
@@ -143,11 +143,12 @@ def _touched_files(
     # deleted files, out-of-tree refs — drops here. One query, no loop.
     candidates = list(counts.keys())
     placeholders = ",".join("?" * len(candidates))
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         f"SELECT rel_path FROM files "
         f"WHERE project_id = ? AND rel_path IN ({placeholders})",
         (project_id, *candidates),
-    ).fetchall()
+    )
     indexed = {r[0] for r in rows}
 
     scored = [(p, counts[p]) for p in candidates if p in indexed]
@@ -210,16 +211,18 @@ def _hub_files(
     conn: Connection, project_id: int, n: int
 ) -> list[tuple[str, int]]:
     """Top-N files by in-degree in the project's file_edges graph."""
-    rows = conn.execute(
+    # f.rel_path in GROUP BY for PostgreSQL strictness (sqlite is lenient).
+    rows = db.fetch_all(
+        conn,
         """
         SELECT f.rel_path, COUNT(*) AS in_degree
         FROM file_edges e
         JOIN files f ON f.id = e.target_file_id
         WHERE e.project_id = ? AND e.target_file_id IS NOT NULL
-        GROUP BY e.target_file_id
+        GROUP BY e.target_file_id, f.rel_path
         ORDER BY in_degree DESC, f.rel_path ASC
         LIMIT ?
         """,
         (project_id, n),
-    ).fetchall()
+    )
     return [(r[0], r[1]) for r in rows]

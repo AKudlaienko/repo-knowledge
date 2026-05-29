@@ -7,17 +7,74 @@ allowed-tools: Bash Read
 
 # /knowledge — Code cartography + semantic search + session memory
 
-One SQLite DB at `~/.knowledge/index.sqlite` holds chunks, edges, history, and decisions for every repo the user has indexed. Complements `Grep` (exact text) and `graphify` (one-off structural dependencies).
+Default: one SQLite DB at `~/.knowledge/index.sqlite` holds chunks, edges, history, and decisions for every repo the user has indexed. **Team shared mode** (optional, per-project): drop a `.knowledge.yaml` (template at `knowledge/config.example.yaml`) in the repo root or in `$HOME` with `storage.mode: shared_postgresql`; closer-to-cwd file wins, so project A can live in shared PG while project B stays on local sqlite. Credentials are env-vars on each laptop (`KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD` — never commit values; see `knowledge/config.example.env`). Complements `Grep` (exact text) for meaning-shaped questions.
 
 ## Priority directives — READ FIRST
 
-These three rules apply on every invocation. They exist because they reduce tool-call count and keep cross-session continuity intact.
+These four rules apply on every invocation. They exist because they reduce tool-call count, prevent re-opening solved problems, and keep cross-session continuity intact.
 
 1. **On a new session, run `knowledge resume` BEFORE any other tool** in this skill.  It returns last decisions + touched files + any un-ingested stage entries + hub files. ~1200 tokens, <200ms. Skip only when the user's very first message makes it obvious (e.g. a typo fix on a specific line).
 
-2. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha). `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
+2. **Pre-change conflict check (MANDATORY before any plan or non-trivial change).** See the dedicated section below. The user has lost time to changes that re-opened already-solved problems because a new session had no memory of the prior fight. This check is non-negotiable — even when the request looks small.
 
-3. **Log non-obvious choices with `knowledge decide` as you make them, not at session end.** Each decision is embedded — `knowledge resume` surfaces the latest five every new session, and `knowledge decisions --search "<topic>"` finds older ones. A two-minute `decide` call today saves a 20-minute "why did we do this" excavation next week.
+3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha). `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
+
+4. **Log non-obvious choices with `knowledge decide` as you make them, not at session end.** Each decision is embedded — `knowledge resume` surfaces the latest five every new session, and `knowledge decisions --search "<topic>"` finds older ones. A two-minute `decide` call today saves a 20-minute "why did we do this" excavation next week.
+
+## Pre-change conflict check (MANDATORY)
+
+Before drafting a plan, before writing/editing any file, and before each major step within a multi-step plan, query the index for prior decisions and incidents on the same topic. Sessions are weeks apart; the user will not remember every prior fight, and neither will you. The index does.
+
+**Required queries (run in parallel when possible):**
+
+1. `knowledge decisions --search "<topic>"` — prior `knowledge decide` entries on the same area.
+2. `knowledge history search "<topic>"` — past work-log entries: incidents, rollbacks, painful fixes.
+3. `knowledge relations <file>` for each file you intend to touch — hidden coupling that was likely the *reason* for an earlier decision.
+4. `knowledge ask "what did we decide / fix about <topic>?"` — semantic catch-all when the topic word is fuzzy.
+
+**STOP conditions — halt and surface to the user before continuing if ANY apply:**
+
+- The proposed change contradicts a prior `knowledge decide` entry.
+- The proposed change matches a pattern that previously caused an incident in `knowledge history` (e.g. "we tried this last month and it broke X").
+- The user's request appears to undo work captured in a recent `knowledge history` milestone.
+- The change touches a hub file or high-blast-radius file with no prior decision context (ask before proceeding).
+
+**Required warning format when stopping** (do not silently push through):
+
+> ⚠️ **Conflict with prior knowledge — stopping before change**
+> - **Decision** `<topic>` (`<date>`): `<one-line summary>` — *Reason given:* `<why>`
+> - **History** `<id>` (`<date>`): `<one-line summary of what happened / what was fixed>`
+> - **Why this matters now**: `<concrete reason the proposed change re-opens the same problem>`
+> - **Options**:
+>   1. Proceed and supersede the prior decision — I will record a new `knowledge decide` explaining the reversal.
+>   2. Adapt the plan to honor the prior decision (preferred default).
+>   3. Need clarification from you.
+
+If the user explicitly chooses (1), record a new `knowledge decide` referencing and superseding the old one as part of the change. Never overwrite history silently.
+
+## Finding code — intent → verb
+
+| Intent | Use |
+|--------|-----|
+| Unfamiliar repo | **`knowledge brief`**, then `knowledge map` |
+| Meaning / "how does X" / "where is Y" | **`knowledge ask "<question>"`** (default — not `search`) |
+| Known symbol | **`knowledge find <name>`** |
+| Exact phrase / keyword | **`knowledge grep '<pattern>'`** |
+| One file before Read | **`knowledge why <path>`** |
+| Imports / callers / blast radius | **`knowledge relations <file>`** before `ask` |
+| Continue prior work | **`knowledge history recent`** or `knowledge decisions --search "<topic>"` |
+
+Only after these return paths and line ranges: **Read** those slices. Built-in **Grep**/**Glob** only on paths the index has already narrowed — never as the first repo-wide step.
+
+### Prohibited
+
+- Repository-wide **Grep**, **Glob**, or **Task**/`explore` subagents as the **first** step for meaning-shaped questions.
+- Speculative reads of whole trees or large files.
+- **`knowledge search`** for normal Q&A — use **`knowledge ask`**.
+
+### Escalation order
+
+`knowledge` (resume → status → relations / ask / find / grep / why) → `docs/` → targeted **Read** → **Grep**/**Glob** only on a path the index already returned.
 
 ## Auto-maintenance — run BEFORE any query verb
 
@@ -29,6 +86,26 @@ Branch on `state`:
 - `missing` → `knowledge build` (first-time: 1–5 min for embedding model + initial encode; warn the user).
 - `stale`   → `knowledge update` (usually <5s; only re-embeds chunks whose sanitized text changed).
 - `fresh`   → go straight to your query verb.
+
+## Storage routing — where does my data live?
+
+The skill talks to whichever backend the current cwd resolves to. Resolution order:
+
+1. `KNOWLEDGE_DATABASE_URL` env (CI override) — full DSN, wins everything.
+2. Walk cwd → its parents looking for `.knowledge.yaml` — first match wins.
+3. `$HOME/.knowledge.yaml` — laptop-wide default.
+4. Built-in default: SQLite at `~/.knowledge/index.sqlite`.
+
+Same name + same YAML schema at every scope; the closer file wins, so project A on shared PG and project B on local SQLite is fine on the same laptop. Two ways to check what's active right now:
+
+```bash
+knowledge config show         # mode + masked DSN + which file is active
+knowledge db ping             # opens the connection, version + schema status (read-only)
+```
+
+When a verb fails with `psycopg.ProgrammingError` or `missing PostgreSQL credentials` — first thing to do is `knowledge config show` and `knowledge config check-env`. Credentials live only in env (`KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD`), never in any committed file.
+
+For migrating an existing local-SQLite project to a PG container, use `knowledge db migrate --project <name> --dry-run` to preview, then drop `--dry-run`. The local SQLite copy is never modified.
 
 ## The six agent-speed verbs
 

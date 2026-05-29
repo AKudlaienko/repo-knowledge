@@ -22,7 +22,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import config
+from . import config, db
 from .db import Connection
 from .search import SearchResult
 
@@ -69,12 +69,13 @@ def get(
 ) -> list[SearchResult] | None:
     """Return cached ``SearchResult`` list, or ``None`` on miss/expired."""
     now = time.time()
-    row = conn.execute(
+    row = db.fetch_one(
+        conn,
         "SELECT result_json FROM query_cache "
         "WHERE project_id = ? AND query_hash = ? AND head_sha = ? "
         "  AND expires_at > ?",
         (project_id, query_hash, head_sha, now),
-    ).fetchone()
+    )
     if row is None:
         return None
     try:
@@ -101,7 +102,11 @@ def put(
     expires = now + _TTL_SECONDS
     # SearchResult is a NamedTuple; _asdict() is stable.
     payload = json.dumps([r._asdict() for r in results], default=str)
-    conn.execute(
+    # ON CONFLICT ... DO UPDATE is supported by both SQLite (>=3.24) and
+    # PostgreSQL with identical syntax. The ``excluded`` pseudo-table works
+    # the same on both.
+    db.execute(
+        conn,
         "INSERT INTO query_cache(project_id, query_hash, head_sha, "
         "result_json, created_at, expires_at) "
         "VALUES (?, ?, ?, ?, ?, ?) "
@@ -120,13 +125,22 @@ def wipe_project(conn: Connection, project_id: int) -> int:
     results embed chunk ids + file paths, so stale chunks yield stale
     citations.
     """
-    conn.execute("DELETE FROM query_cache WHERE project_id = ?", (project_id,))
-    # APSW: .changes() on the Connection returns the row count of the
-    # last statement. Cursor.rowcount is stdlib-only.
+    db.execute(
+        conn, "DELETE FROM query_cache WHERE project_id = ?", (project_id,)
+    )
+    # Row count: APSW exposes ``Connection.changes()`` for the last
+    # statement; psycopg only exposes ``rowcount`` on the cursor — and
+    # ``db.execute`` already discarded that cursor. Caller doesn't use
+    # the return value for any control flow, so ``0`` is a safe stand-in
+    # for the PG path.
     return conn.changes() if hasattr(conn, "changes") else 0
 
 
 def sweep_expired(conn: Connection) -> int:
     """Drop rows past their TTL. Cheap opportunistic housekeeping."""
-    conn.execute("DELETE FROM query_cache WHERE expires_at < ?", (time.time(),))
+    db.execute(
+        conn,
+        "DELETE FROM query_cache WHERE expires_at < ?",
+        (time.time(),),
+    )
     return conn.changes() if hasattr(conn, "changes") else 0

@@ -34,8 +34,21 @@ def models_dir() -> Path:
 
 
 def config_path() -> Path:
-    """Global user config (cache budget, model override)."""
-    return user_dir() / "config.json"
+    """Laptop-default config file location (``~/.knowledge.yaml``).
+
+    This is the file ``knowledge config init`` writes by default. At runtime
+    the same file is also discoverable via the cwd walk-up done in
+    :func:`knowledge.settings.load_settings` — every search ends here when
+    nothing closer to the cwd has a ``.knowledge.yaml``. Same shape as the
+    in-repo file so callers can move config from one scope to the other
+    by copying.
+
+    Note: this lives at ``$HOME/.knowledge.yaml`` (a *file* in home), not
+    inside ``$HOME/.knowledge/`` (the state directory holding the sqlite
+    DB, models cache, and stage files). Two distinct paths, two distinct
+    purposes.
+    """
+    return Path.home() / ".knowledge.yaml"
 
 
 def stage_dir() -> Path:

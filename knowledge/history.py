@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
-from . import config
+from . import config, db
 from .db import Connection
 from .embedder import get_embedder
 
@@ -65,27 +65,25 @@ def add(
     ``ingest_stage`` instead — it batches the encode call.
     """
     vec = get_embedder().encode([short_summary])[0]
-    with conn:
+    with db.transaction(conn):
         now = time.time()
-        conn.execute(
+        new_id = db.execute_returning_id(
+            conn,
             "INSERT INTO history("
             "project_id, created_at, short_summary, long_summary, "
             "session_id, tags) VALUES (?, ?, ?, ?, ?, ?)",
             (project_id, now, short_summary, long_summary, session_id, tags),
         )
-        new_id = conn.last_insert_rowid()
-        conn.execute(
-            "INSERT INTO history_vec(history_id, embedding) VALUES (?, ?)",
-            (new_id, vec.tobytes()),
-        )
+        db.insert_history_embedding(conn, new_id, vec)
     return new_id
 
 
 def get(conn: Connection, history_id: int) -> HistoryEntry | None:
-    row = conn.execute(
+    row = db.fetch_one(
+        conn,
         f"SELECT {_SELECT_COLS} FROM history WHERE id = ?",
         (history_id,),
-    ).fetchone()
+    )
     return _row_to_entry(row) if row else None
 
 
@@ -108,11 +106,12 @@ def recent(
         params.append(time.time() - days * 86400)
     extra = ("WHERE " + " AND ".join(where)) if where else ""
     params.append(limit)
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         f"SELECT {_SELECT_COLS} FROM history {extra} "
         f"ORDER BY created_at DESC LIMIT ?",
-        params,
-    ).fetchall()
+        tuple(params),
+    )
     return [_row_to_entry(r) for r in rows]
 
 
@@ -131,16 +130,42 @@ def search(
     q_vec = get_embedder().encode([query])[0]
     k_fetch = top_k * 3 if project_id is not None else top_k
 
-    where_clauses: list[str] = []
-    params: list = [q_vec.tobytes(), k_fetch]
+    if db.current_mode() == "postgresql":
+        where_clauses: list[str] = []
+        filter_params: list = []
+        if project_id is not None:
+            where_clauses.append("h.project_id = %s")
+            filter_params.append(project_id)
+        extra_where = (
+            "AND " + " AND ".join(where_clauses) if where_clauses else ""
+        )
+        cols = ", ".join("h." + c for c in _SELECT_COLS.split(", "))
+        sql = f"""
+            SELECT {cols}, (e.embedding <=> %s) AS distance
+            FROM history_embeddings e
+            JOIN history h ON h.id = e.history_id
+            WHERE TRUE {extra_where}
+            ORDER BY e.embedding <=> %s
+            LIMIT %s
+        """
+        # SQL placeholder order: distance projection, filter clauses,
+        # ORDER BY operand, LIMIT.
+        params = [q_vec, *filter_params, q_vec, top_k]
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [(_row_to_entry(r[:-1]), float(r[-1])) for r in rows]
+
+    # SQLite path — sqlite-vec virtual table.
+    where_clauses = []
+    params = [q_vec.tobytes(), k_fetch]
     if project_id is not None:
         where_clauses.append("h.project_id = ?")
         params.append(project_id)
     extra_where = ("AND " + " AND ".join(where_clauses)) if where_clauses else ""
-
+    cols = ", ".join("h." + c for c in _SELECT_COLS.split(", "))
     sql = f"""
-        SELECT {", ".join("h." + c for c in _SELECT_COLS.split(", "))},
-               v.distance
+        SELECT {cols}, v.distance
         FROM history_vec v
         JOIN history h ON h.id = v.history_id
         WHERE v.embedding MATCH ? AND k = ?
@@ -190,10 +215,11 @@ def _insert_entries(
     """
     shorts = [e["short"] for e in entries]
     vecs = get_embedder().encode(shorts)
-    with conn:  # APSW savepoint: all-or-nothing for this batch
+    with db.transaction(conn):  # all-or-nothing for this batch
         now = time.time()
         for obj, vec in zip(entries, vecs):
-            conn.execute(
+            new_id = db.execute_returning_id(
+                conn,
                 "INSERT INTO history("
                 "project_id, created_at, short_summary, long_summary, "
                 "session_id, tags) VALUES (?, ?, ?, ?, ?, ?)",
@@ -206,11 +232,7 @@ def _insert_entries(
                     obj.get("tags"),
                 ),
             )
-            new_id = conn.last_insert_rowid()
-            conn.execute(
-                "INSERT INTO history_vec(history_id, embedding) VALUES (?, ?)",
-                (new_id, vec.tobytes()),
-            )
+            db.insert_history_embedding(conn, new_id, vec)
 
 
 def ingest_stage(

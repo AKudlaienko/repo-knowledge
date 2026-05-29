@@ -34,6 +34,7 @@ import html
 import json
 from typing import NamedTuple
 
+from . import db
 from .db import Connection
 
 
@@ -131,7 +132,8 @@ def _collect(
     # One query to pull every edge we might include; we filter in
     # Python because the predicates mix NULL-checks, kind exclusions,
     # and raw-substring checks that aren't worth a 5-branch SQL CASE.
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         """
         SELECT e.source_file_id, sf.rel_path, sf.lang,
                e.target_file_id, tf.rel_path, tf.lang,
@@ -142,7 +144,7 @@ def _collect(
         WHERE e.project_id = ?
         """,
         (project_id,),
-    ).fetchall()
+    )
 
     nodes_by_id: dict[int, GraphNode] = {}
     edges: list[GraphEdge] = []
@@ -325,10 +327,11 @@ def _ensure_all_project_nodes(
     ``_remember_file``'s dedup. This is the "repo map" pass — isolated
     dots mean the file is indexed but has no resolved relations.
     """
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         "SELECT id, rel_path, lang FROM files WHERE project_id = ?",
         (project_id,),
-    ).fetchall()
+    )
     for file_id, rel_path, lang in rows:
         _remember_file(nodes_by_id, file_id, rel_path, lang)
 
@@ -342,7 +345,8 @@ def _ensure_cicd_nodes(
     Without this pass, it would vanish from the graph with no signal
     that it was indexed.
     """
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         """
         SELECT id, rel_path, lang FROM files
         WHERE project_id = ?
@@ -357,7 +361,7 @@ def _ensure_cicd_nodes(
           AND rel_path LIKE '.github/actions/%/action.yaml'
         """,
         (project_id, project_id, project_id),
-    ).fetchall()
+    )
     for file_id, rel_path, lang in rows:
         if not _is_cicd_file(rel_path):
             # LIKE is coarse (matches ``.github/workflows/README.md``);

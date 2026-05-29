@@ -203,7 +203,15 @@ def main(argv: list[str] | None = None) -> int:
     p_path.add_argument("chunk_id", type=int)
 
     # projects
-    sub.add_parser("projects", help="List registered projects")
+    p_projects = sub.add_parser("projects", help="List registered projects")
+    p_projects.add_argument(
+        "--local-sqlite",
+        action="store_true",
+        help="Force the listing against local sqlite even if the current "
+             "cwd resolves to shared PostgreSQL. Useful for spotting "
+             "projects you haven't migrated yet, or for verifying a "
+             "post-migrate forget --sqlite-only worked.",
+    )
 
     # stats
     p_stats = sub.add_parser("stats", help="DB + project statistics")
@@ -212,6 +220,13 @@ def main(argv: list[str] | None = None) -> int:
     # forget
     p_forget = sub.add_parser("forget", help="Delete a project and all its chunks")
     p_forget.add_argument("project", help="Project name or absolute path")
+    p_forget.add_argument(
+        "--sqlite-only",
+        action="store_true",
+        help="Force the deletion against local sqlite even if the current "
+             "cwd resolves to shared PostgreSQL. Use after `db migrate` to "
+             "drop the now-redundant local copy without cwd gymnastics.",
+    )
 
     # history (nested subcommands)
     p_history = sub.add_parser("history", help="Work-summary storage (RAG memory)")
@@ -436,6 +451,84 @@ def main(argv: list[str] | None = None) -> int:
         help="Overwrite existing SKILL.md at the target",
     )
 
+    # config — runtime settings (storage mode, PG DSN status). Phase 0 of
+    # the shared-PostgreSQL plan; works against sqlite-only installs too
+    # (just reports "mode: sqlite").
+    p_config = sub.add_parser(
+        "config",
+        help="Inspect / initialize .knowledge.yaml (storage mode, PG env)",
+    )
+    p_config_sub = p_config.add_subparsers(dest="config_cmd", required=True)
+
+    p_cfg_init = p_config_sub.add_parser(
+        "init",
+        help="Write a .knowledge.yaml: $HOME by default, --project for the git root",
+    )
+    p_cfg_init.add_argument(
+        "--project",
+        action="store_true",
+        help="Write to <git-root>/.knowledge.yaml instead of $HOME/.knowledge.yaml. "
+             "Same schema either way; the closer file wins at runtime.",
+    )
+    p_cfg_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing .knowledge.yaml at the chosen target",
+    )
+
+    p_cfg_show = p_config_sub.add_parser(
+        "show",
+        help="Print effective storage mode, masked DSN, env-var status, source",
+    )
+    p_cfg_show.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_config_sub.add_parser(
+        "check-env",
+        help="Verify KNOWLEDGE_PG_* env vars are set when mode=shared_postgresql",
+    )
+
+    # db — backend administration (init-postgres). Phase 1a of the shared-PG
+    # plan; only meaningful when storage.mode = shared_postgresql.
+    p_db = sub.add_parser(
+        "db",
+        help="Backend administration (ping, init-postgres, …)",
+    )
+    p_db_sub = p_db.add_subparsers(dest="db_cmd", required=True)
+    p_db_sub.add_parser(
+        "ping",
+        help="Open a connection to the configured backend, report version + "
+             "extension status, then close. No state changes. Use this to "
+             "verify your config / env / network before knowledge build.",
+    )
+    p_db_sub.add_parser(
+        "init-postgres",
+        help="Apply knowledge/schema/postgres/*.sql to the configured PG database "
+             "(idempotent — re-applies are no-ops)",
+    )
+    p_db_migrate = p_db_sub.add_parser(
+        "migrate",
+        help="Copy ONE project from local SQLite to the configured shared PG. "
+             "Embeddings, edges, history, decisions, project variables. "
+             "Idempotent only at the conflict-check level — re-running on a "
+             "project already present on PG fails fast.",
+    )
+    p_db_migrate.add_argument(
+        "--project",
+        required=True,
+        help="Project name or absolute path (resolved against local sqlite)",
+    )
+    p_db_migrate.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation prompt (use in scripts/CI)",
+    )
+    p_db_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run pre-flight checks (resolve, model match, conflict, counts) "
+             "and print the plan; do not write to PG",
+    )
+
     # install-hooks
     p_hooks = sub.add_parser(
         "install-hooks",
@@ -472,10 +565,11 @@ def cmd_build(args: argparse.Namespace) -> int:
         # Rebuild in place? If a row already exists at this exact root, it's
         # not a collision — just a re-build of the same project. Skip the
         # collision check so the user isn't prompted on every rebuild.
-        existing_here = conn.execute(
+        existing_here = db.fetch_one(
+            conn,
             "SELECT 1 FROM projects WHERE root_path = ? LIMIT 1",
             (str(root.resolve()),),
-        ).fetchone()
+        )
 
         resolved_name = proposed_name
         ids_to_forget: list[int] = []
@@ -515,9 +609,13 @@ def cmd_build(args: argparse.Namespace) -> int:
             print(f"registering as: {resolved_name}", flush=True)
 
         t0 = time.time()
-        project_id, files, chunks = indexer.build_project(
-            conn, root, name_override=resolved_name
-        )
+        try:
+            project_id, files, chunks = indexer.build_project(
+                conn, root, name_override=resolved_name
+            )
+        except db.ProjectBusyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 3
     elapsed = time.time() - t0
     print(f"done: {files} files, {chunks} chunks in {elapsed:.1f}s (project_id={project_id})")
     return 0
@@ -530,9 +628,13 @@ def cmd_update(args: argparse.Namespace) -> int:
     print(f"updating index for: {root}", flush=True)
     t0 = time.time()
     with db.connect() as conn:
-        project_id, files_visited, chunks_embedded = indexer.update_project(
-            conn, root, name_override=None
-        )
+        try:
+            project_id, files_visited, chunks_embedded = indexer.update_project(
+                conn, root, name_override=None
+            )
+        except db.ProjectBusyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 3
     elapsed = time.time() - t0
     print(
         f"done: {files_visited} files visited, {chunks_embedded} chunks "
@@ -600,10 +702,11 @@ def _project_is_stale(conn, proj) -> bool:
     or is missing from disk. Early-exits on first stale finding."""
     from . import config as _config
 
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         "SELECT rel_path, mtime FROM files WHERE project_id = ?",
         (proj.id,),
-    ).fetchall()
+    )
 
     root = proj.root_path
     grace = _config.STALE_GRACE_SECONDS
@@ -1218,6 +1321,9 @@ def cmd_path(args: argparse.Namespace) -> int:
 
 
 def cmd_projects(args: argparse.Namespace) -> int:
+    if getattr(args, "local_sqlite", False):
+        return _cmd_projects_sqlite_only()
+
     with db.connect() as conn:
         rows = projects.list_projects(conn)
     if not rows:
@@ -1232,13 +1338,56 @@ def cmd_projects(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_projects_sqlite_only() -> int:
+    """List projects from local sqlite regardless of cwd resolution.
+
+    Same dispatch-bypass pattern as ``forget --sqlite-only`` — opens
+    raw APSW via :func:`db.connect_sqlite` so the listing reflects the
+    laptop's local index even when the current cwd routes everything
+    else to shared PostgreSQL.
+    """
+
+    conn = db.connect_sqlite()
+    try:
+        rows = conn.execute(
+            "SELECT name, root_path, file_count, chunk_count "
+            "FROM projects ORDER BY name"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        print("No projects in local sqlite.")
+        return 0
+    header = f"{'NAME':<24} {'FILES':>6} {'CHUNKS':>7}  ROOT"
+    print(header)
+    print("-" * len(header))
+    for name, root, fc, cc in rows:
+        print(f"{name:<24} {fc:>6} {cc:>7}  {root}")
+    print()
+    print(f"({len(rows)} project(s) — sqlite source: {paths.db_path()})")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     with db.connect() as conn:
         rows = projects.list_projects(conn)
-        total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        total_files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    print(f"DB:          {paths.db_path()}")
-    print(f"DB size:     {_format_size(paths.db_path())}")
+        total_chunks = db.fetch_one(conn, "SELECT COUNT(*) FROM chunks")[0]
+        total_files = db.fetch_one(conn, "SELECT COUNT(*) FROM files")[0]
+    if db.current_mode() == "postgresql":
+        from . import settings as settings_mod
+
+        s = settings_mod.load_settings()
+        pg = s.postgresql
+        backend_descr = (
+            f"postgresql ({pg.host}:{pg.port}/{pg.database})"
+            if pg is not None else "postgresql"
+        )
+        print(f"DB:          {backend_descr}")
+        print(f"config:      {s.config_source}")
+    else:
+        print(f"DB:          {paths.db_path()}")
+        print(f"DB size:     {_format_size(paths.db_path())}")
     print(f"Projects:    {len(rows)}")
     print(f"Files:       {total_files}")
     print(f"Chunks:      {total_chunks}")
@@ -1255,6 +1404,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_forget(args: argparse.Namespace) -> int:
+    if getattr(args, "sqlite_only", False):
+        return _cmd_forget_sqlite_only(args)
+
     with db.connect() as conn:
         try:
             proj = projects.resolve_project(conn, args.project)
@@ -1275,6 +1427,98 @@ def cmd_forget(args: argparse.Namespace) -> int:
             return 1
         projects.forget_project(conn, proj.id)
     print(f"forgot: {proj.name} ({proj.root_path})")
+    return 0
+
+
+def _cmd_forget_sqlite_only(args: argparse.Namespace) -> int:
+    """Force-delete a project from local sqlite regardless of current cwd's mode.
+
+    Uses raw APSW (``db.connect_sqlite()`` + ``conn.execute()``) so we
+    don't go through the ``db.fetch_one`` / ``db.execute`` helpers that
+    dispatch on ``current_mode()``. When current_mode is "postgresql"
+    those helpers would translate ``?`` placeholders to ``%s`` and break
+    on APSW.
+    """
+
+    selector = args.project
+    p = Path(selector).expanduser()
+    conn = db.connect_sqlite()
+    try:
+        if p.is_absolute():
+            row = conn.execute(
+                "SELECT id, name, root_path FROM projects WHERE root_path = ?",
+                (str(p.resolve()),),
+            ).fetchone()
+            matches = [row] if row else []
+        else:
+            matches = conn.execute(
+                "SELECT id, name, root_path FROM projects WHERE name = ?",
+                (selector,),
+            ).fetchall()
+
+        if not matches:
+            print(
+                f"error: project not found in local sqlite: {selector}",
+                file=sys.stderr,
+            )
+            return 1
+
+        if len(matches) > 1:
+            if not sys.stdin.isatty():
+                print(
+                    f"error: '{selector}' matches {len(matches)} local sqlite "
+                    f"rows. Re-run with the absolute path:",
+                    file=sys.stderr,
+                )
+                for _id, _name, root in matches:
+                    print(f"  {root}", file=sys.stderr)
+                return 1
+            print(
+                f"'{selector}' matches {len(matches)} local sqlite rows.",
+                "Pick which to forget (comma-separated indexes, or 'all'):",
+            )
+            for i, (_id, name, root) in enumerate(matches, start=1):
+                print(f"  [{i}] {name}  {root}")
+            try:
+                answer = input("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\naborted.", file=sys.stderr)
+                return 1
+            if answer == "all":
+                chosen = matches
+            else:
+                idxs = [int(t) for t in answer.split(",") if t.strip().isdigit()]
+                chosen = [matches[i - 1] for i in idxs if 1 <= i <= len(matches)]
+            if not chosen:
+                print("aborted.", file=sys.stderr)
+                return 1
+        else:
+            chosen = matches
+
+        # vec0 has no FK cascade; wipe per-table before dropping the
+        # project row. ``meta`` / `query_cache` cascade naturally via the
+        # projects.id FK.
+        for proj_id, name, root in chosen:
+            conn.execute(
+                "DELETE FROM chunks_vec WHERE chunk_id IN "
+                "(SELECT id FROM chunks WHERE project_id = ?)",
+                (proj_id,),
+            )
+            conn.execute(
+                "DELETE FROM history_vec WHERE history_id IN "
+                "(SELECT id FROM history WHERE project_id = ?)",
+                (proj_id,),
+            )
+            conn.execute(
+                "DELETE FROM decisions_vec WHERE decision_id IN "
+                "(SELECT id FROM decisions WHERE project_id = ?)",
+                (proj_id,),
+            )
+            conn.execute("DELETE FROM projects WHERE id = ?", (proj_id,))
+            print(f"forgot from sqlite: {name} ({root})")
+    finally:
+        # APSW connections close on garbage collection but be explicit.
+        conn.close()
     return 0
 
 
@@ -1324,6 +1568,23 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
         print("  the `/knowledge` skill is now available in this project.")
         print("  commit .claude/skills/knowledge/SKILL.md if you want teammates to share it.")
     print("  from a repo root, run `knowledge build` once to index the code.")
+
+    # Hint when this scope resolves to shared_postgresql — agents picking up
+    # the skill need the env vars set, otherwise every command fails at the
+    # first DSN resolution.
+    from . import settings as settings_mod
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError:
+        return 0
+    if s.mode == "shared_postgresql":
+        print()
+        print(
+            "shared_postgresql is active for this scope "
+            f"({s.config_source}) — verify the laptop has env vars exported:"
+        )
+        print("  knowledge config check-env")
     return 0
 
 
@@ -1882,12 +2143,13 @@ def _sibling_files(conn, project_id: int, rel_path: str) -> list[dict]:
     """
     dir_prefix = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
     pattern = f"{dir_prefix}/%" if dir_prefix else "%"
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         "SELECT rel_path, lang FROM files "
         "WHERE project_id = ? AND rel_path LIKE ? AND rel_path != ? "
         "ORDER BY rel_path LIMIT 50",
         (project_id, pattern, rel_path),
-    ).fetchall()
+    )
     # Exclude rows that are in SUBdirectories — pattern ``dir/%`` also
     # matches ``dir/sub/file``. Drop anything with a deeper slash count.
     target_depth = rel_path.count("/")
@@ -2473,6 +2735,455 @@ _DISPATCH = {
     "graph": cmd_graph,
     "install-skill": cmd_install_skill,
     "install-hooks": cmd_install_hooks,
+    "config": lambda args: _CONFIG_DISPATCH[args.config_cmd](args),
+    "db": lambda args: _DB_DISPATCH[args.db_cmd](args),
+}
+
+
+# ---------------------------------------------------------------------------
+# config subcommands (Phase 0)
+# ---------------------------------------------------------------------------
+
+
+def cmd_config_init(args: argparse.Namespace) -> int:
+    """Write a ``.knowledge.yaml`` at the chosen scope.
+
+    Default target: ``$HOME/.knowledge.yaml`` (laptop default).
+    With ``--project``: ``<git-root>/.knowledge.yaml`` (per-repo override).
+
+    Same file name and schema at every scope; resolution at runtime walks
+    up from cwd and uses the closest match (with $HOME as last-resort
+    fallback). So ``--project`` is just "put it closer", nothing more.
+
+    Refuses to overwrite an existing file unless ``--force`` is passed.
+    """
+
+    if getattr(args, "project", False):
+        dst = projects.current_project_root() / ".knowledge.yaml"
+        scope = "project"
+    else:
+        dst = paths.config_path()
+        scope = "laptop default"
+
+    if dst.exists() and not args.force:
+        print(f"{dst} already exists. Use --force to overwrite.", file=sys.stderr)
+        return 1
+
+    src = Path(__file__).parent / "config.example.yaml"
+    dst.write_text(src.read_text("utf-8"), encoding="utf-8")
+    print(f"wrote {dst}  ({scope})")
+    print("next: edit storage.mode if you want shared_postgresql, then")
+    print("      copy knowledge/config.example.env to your shell profile and")
+    print("      export KNOWLEDGE_PG_USER / KNOWLEDGE_PG_PASSWORD.")
+    print("      knowledge config show  # confirms which file is in effect")
+    return 0
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    """Print mode + masked DSN + env-var status + source.
+
+    Never prints secrets — passwords are masked, env-var values are reported
+    as ``set`` / ``unset`` only.
+    """
+
+    from . import settings as settings_mod
+
+    report = settings_mod.build_report()
+    s = report.settings
+    if args.json:
+        out = {
+            "mode": s.mode,
+            "config_source": s.config_source,
+            "dsn_source": report.dsn_source,
+            "dsn_masked": report.dsn_masked,
+            "env_status": report.env_status,
+            "error": report.error,
+        }
+        print(json.dumps(out, indent=2))
+        return 0 if not report.error else 1
+
+    print(f"mode:           {s.mode}")
+    print(f"config_source:  {s.config_source}{_describe_source(s.config_source)}")
+    print(f"dsn_source:     {report.dsn_source}")
+    if s.mode == "shared_postgresql":
+        if report.dsn_masked:
+            print(f"dsn:            {report.dsn_masked}")
+        for name, present in report.env_status.items():
+            print(f"{name:14s}  {'set' if present else 'unset'}")
+    if report.error:
+        print(f"error:          {report.error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _describe_source(source: str) -> str:
+    """Append a human-readable scope tag to a config_source path.
+
+    Same file name everywhere now (``.knowledge.yaml``), so the tag is
+    derived from *where* the file was found: the laptop default lives at
+    ``$HOME/.knowledge.yaml``; anything else is per-project (or per-subdir).
+    """
+
+    if source == "default":
+        return ""
+    try:
+        # Resolve both sides to match symlinks (macOS ``/tmp`` ↔
+        # ``/private/tmp`` etc. — settings.load_settings calls .resolve()
+        # on the discovered path, paths.config_path() does not).
+        if Path(source).resolve() == paths.config_path().resolve():
+            return "  (laptop default)"
+    except OSError:
+        pass
+    return "  (project)"
+
+
+def cmd_config_check_env(args: argparse.Namespace) -> int:
+    """Exit 0 if PG env vars are set (or mode is sqlite); exit 2 otherwise.
+
+    Designed for CI / shell scripts: ``knowledge config check-env || exit``.
+    """
+
+    from . import settings as settings_mod
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if s.mode == "sqlite":
+        print("mode: sqlite — env vars not required")
+        return 0
+
+    try:
+        settings_mod.resolve_pg_dsn(s)
+    except settings_mod.DsnError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print("ok: shared_postgresql credentials resolved from environment")
+    return 0
+
+
+_CONFIG_DISPATCH = {
+    "init": cmd_config_init,
+    "show": cmd_config_show,
+    "check-env": cmd_config_check_env,
+}
+
+
+# ---------------------------------------------------------------------------
+# db subcommands (Phase 1a)
+# ---------------------------------------------------------------------------
+
+
+def cmd_db_init_postgres(args: argparse.Namespace) -> int:
+    """Apply ``knowledge/schema/postgres/NNN_*.sql`` to the configured DB.
+
+    Refuses to run unless ``storage.mode == 'shared_postgresql'`` — there
+    is no scenario where a sqlite-only user benefits from creating a remote
+    PG schema. Migrations are idempotent (every CREATE uses IF NOT EXISTS),
+    so re-running is safe — handy when bumping the schema version later.
+    """
+
+    del args  # currently unused
+    from . import settings as settings_mod
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if s.mode != "shared_postgresql":
+        print(
+            "error: storage.mode is 'sqlite'. Set "
+            "storage.mode='shared_postgresql' in a discoverable .knowledge.yaml "
+            "(repo root or $HOME) "
+            "before running this.",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .backends.postgres import PostgresBackend, _DependencyMissing
+
+    backend = PostgresBackend(s)
+    try:
+        conn = backend.connect()
+    except _DependencyMissing as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except settings_mod.DsnError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — psycopg has many failure modes
+        print(f"error connecting to PostgreSQL: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        applied = backend.apply_schema(conn)
+    finally:
+        conn.close()
+
+    if applied:
+        print("applied:")
+        for name in applied:
+            print(f"  {name}")
+    else:
+        print("no migrations found (knowledge/schema/postgres/ is empty?)")
+    return 0
+
+
+def cmd_db_ping(args: argparse.Namespace) -> int:
+    """Connect to the configured backend, verify it works, close.
+
+    For sqlite: opens the local DB, runs a trivial SELECT, reports the file
+    path and a row-count from `meta`.
+
+    For shared_postgresql: opens psycopg, runs ``SELECT version()``, checks
+    that ``CREATE EXTENSION vector`` has been applied (else hints at
+    ``knowledge db init-postgres``), prints database name + role.
+
+    Exits 2 on any connection or auth failure. Read-only — safe to run
+    against production.
+    """
+
+    del args  # currently unused
+    from . import settings as settings_mod
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if s.mode == "sqlite":
+        return _ping_sqlite()
+    if s.mode == "shared_postgresql":
+        return _ping_postgres(s)
+    print(f"error: unknown storage mode {s.mode!r}", file=sys.stderr)
+    return 2
+
+
+def _ping_sqlite() -> int:
+    try:
+        with db.connect() as conn:
+            row = db.fetch_one(conn, "SELECT value FROM meta WHERE key = ?",
+                               ("schema_version",))
+            schema_version = row[0] if row else "unknown"
+            chunks = db.fetch_one(conn, "SELECT COUNT(*) FROM chunks")[0]
+    except Exception as exc:  # noqa: BLE001 — APSW has many failure modes
+        print(f"error opening sqlite DB: {exc}", file=sys.stderr)
+        return 2
+    print("ok: connected to sqlite")
+    print(f"  path:           {paths.db_path()}")
+    print(f"  schema_version: {schema_version}")
+    print(f"  chunks:         {chunks}")
+    return 0
+
+
+def _ping_postgres(s) -> int:
+    from . import settings as settings_mod
+    from .backends.postgres import PostgresBackend, _DependencyMissing
+
+    backend = PostgresBackend(s)
+    try:
+        conn = backend.connect()
+    except _DependencyMissing as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except settings_mod.DsnError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — psycopg has many failure modes
+        print(f"error connecting to PostgreSQL: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT version()")
+            pg_full = cur.fetchone()[0]
+            cur.execute(
+                "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+            )
+            row = cur.fetchone()
+            pgvector_version = row[0] if row else None
+            cur.execute("SELECT current_database(), current_user")
+            db_name, db_user = cur.fetchone()
+            cur.execute(
+                "SELECT to_regclass('public.projects') IS NOT NULL, "
+                "       to_regclass('public.chunk_embeddings') IS NOT NULL"
+            )
+            schema_ok, embeddings_ok = cur.fetchone()
+            project_count = 0
+            if schema_ok:
+                cur.execute("SELECT COUNT(*) FROM projects")
+                project_count = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    # PostgreSQL 17.0 (Debian 17.0-1.pgdg120+1) on aarch64-... ->
+    # extract just the version number for compactness.
+    pg_short = pg_full.split(" ", 2)[1] if pg_full.startswith("PostgreSQL ") else pg_full
+
+    print(f"ok: connected to {db_name!r} as {db_user!r}")
+    print(f"  postgres: {pg_short}")
+    if pgvector_version:
+        print(f"  pgvector: {pgvector_version}")
+    else:
+        print("  pgvector: NOT INSTALLED")
+        print("            run: knowledge db init-postgres")
+    if schema_ok and embeddings_ok:
+        print(f"  schema:   ready ({project_count} project(s) registered)")
+    else:
+        print("  schema:   NOT APPLIED")
+        print("            run: knowledge db init-postgres")
+    return 0
+
+
+def cmd_db_migrate(args: argparse.Namespace) -> int:
+    """Copy one project from local SQLite to the configured shared PG.
+
+    Two phases (mirrors :mod:`knowledge.migrate.sqlite_to_pg`):
+
+    1. Open both DBs, resolve the source project, validate
+       embedding-model match, check for a target conflict, count rows.
+    2. With ``--dry-run`` we stop here and print the plan. Otherwise we
+       prompt (suppressed by ``--yes``) and execute the copy in one PG
+       transaction.
+
+    Source SQLite is never modified — the local project row stays so you
+    can re-run if something goes wrong on the target side, or compare
+    side-by-side after a successful migrate.
+    """
+
+    from . import migrate, settings as settings_mod
+    from .backends.postgres import PostgresBackend, _DependencyMissing
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if s.mode != "shared_postgresql":
+        print(
+            "error: storage.mode is 'sqlite' — set 'shared_postgresql' in a "
+            "discoverable .knowledge.yaml before migrating.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Open both sides explicitly. db.connect() would dispatch on mode and
+    # give us PG; we need raw sqlite for the source.
+    sqlite_conn = db.connect_sqlite()
+
+    backend = PostgresBackend(s)
+    try:
+        pg_conn = backend.connect()
+    except _DependencyMissing as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except settings_mod.DsnError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — psycopg has many failure modes
+        print(f"error connecting to PostgreSQL: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        try:
+            plan = migrate.prepare(sqlite_conn, pg_conn, args.project)
+        except migrate.MigrationConflict as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except migrate.EmbeddingModelMismatch as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except migrate.MigrationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+        _print_plan(plan, settings=s)
+
+        if args.dry_run:
+            print("\ndry-run: nothing written. drop --dry-run to migrate.")
+            return 0
+
+        if not args.yes:
+            try:
+                answer = input("\nContinue? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\naborted.", file=sys.stderr)
+                return 1
+            if answer not in ("y", "yes"):
+                print("aborted.", file=sys.stderr)
+                return 1
+
+        print("\nmigrating...", flush=True)
+        try:
+            counts = migrate.execute(sqlite_conn, pg_conn, plan)
+        except migrate.MigrationConflict as exc:
+            print(f"\nerror: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001 — surfaces psycopg errors
+            print(f"\nerror during migrate: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        sqlite_conn.close()
+        pg_conn.close()
+
+    print("done. inserted on PG:")
+    for label, value in counts.items():
+        print(f"  {label:20s} {value}")
+    print(
+        f"\nsource SQLite still contains project {plan.project_name!r} "
+        f"(id={plan.sqlite_project_id}). Once you've verified the migrated "
+        "copy works, remove the local row with: "
+        f"knowledge forget {plan.project_name}"
+    )
+    return 0
+
+
+def _print_plan(plan, settings) -> None:
+    """Pretty-print a MigrationPlan for the user to confirm."""
+
+    print(f"source: local SQLite ({paths.db_path()})")
+    print(f"  project_id     {plan.sqlite_project_id}")
+    print(f"  name           {plan.project_name}")
+    print(f"  root           {plan.project_root}")
+    print(f"  git_remote     {plan.git_remote or '(none)'}")
+    print(f"  project_key    {plan.project_key_kind} = "
+          f"{plan.git_remote_normalized or plan.project_root.resolve()}")
+    print(f"  emb. model     {plan.source_embedding_model}")
+    print()
+
+    pg = settings.postgresql
+    if pg is not None:
+        print(f"target: shared PostgreSQL")
+        print(f"  host           {pg.host}")
+        print(f"  database       {pg.database}")
+        print(f"  user (env)     {pg.user_env}")
+        print(f"  emb. model     {plan.target_embedding_model}")
+    else:
+        print("target: shared PostgreSQL (configured)")
+    print()
+
+    print("rows to copy:")
+    print(f"  files               {plan.file_count}")
+    print(f"  chunks              {plan.chunk_count}")
+    print(f"  chunk embeddings    {plan.chunk_embedding_count}")
+    print(f"  file edges          {plan.edge_count}")
+    print(f"  project variables   {plan.variable_count}")
+    print(f"  history             {plan.history_count}")
+    print(f"  history embeddings  {plan.history_embedding_count}")
+    print(f"  decisions           {plan.decision_count}")
+    print(f"  decision embeddings {plan.decision_embedding_count}")
+
+
+_DB_DISPATCH = {
+    "ping": cmd_db_ping,
+    "init-postgres": cmd_db_init_postgres,
+    "migrate": cmd_db_migrate,
 }
 
 

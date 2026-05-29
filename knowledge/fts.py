@@ -1,25 +1,24 @@
-"""Structural lookup: exact-name find + FTS5 grep.
+"""Structural lookup: exact-name find + lexical grep.
 
-Fast answers to the two questions an LLM agent runs most on any repo:
+Backend dispatch:
 
-* ``find("VaultClient")`` — "where is the symbol named X?"
-* ``grep("helm install")`` — "where is this substring / token used?"
+* SQLite: ``find`` hits the partial indexes ``idx_chunks_name`` /
+  ``idx_chunks_qname``; ``grep`` hits the contentless FTS5 virtual table
+  ``chunks_fts`` and returns rows ranked by the FTS5 ``rank`` (BM25).
+* PostgreSQL: ``find`` uses the same partial indexes (PG supports them
+  identically); ``grep`` uses the GENERATED ``chunks.search_vector``
+  ``tsvector`` column with a GIN index, ranked by ``ts_rank_cd``.
 
-Both skip the embedding model entirely. ``find`` hits the partial indexes
-added in schema v2 (``idx_chunks_name`` / ``idx_chunks_qname``); ``grep``
-hits the ``chunks_fts`` contentless FTS5 index (tokenized names +
-``stored_text``). Milliseconds either way.
-
-Returns :class:`knowledge.search.SearchResult` so callers can share the
-``distance`` slot (unused here — always 0.0) and the citations formatter
-with :mod:`knowledge.search`.
+Both paths return identical :class:`SearchResult` tuples. Ranking
+semantics differ between BM25 (SQLite) and ``ts_rank_cd`` (PG) but for
+the symbol+text style queries we run, top-K substance overlaps heavily.
 """
 
 from __future__ import annotations
 
 import re
 
-from . import config
+from . import config, db
 from .db import Connection
 from .search import SearchResult
 
@@ -44,19 +43,9 @@ def find(
 ) -> list[SearchResult]:
     """Find chunks by symbol name.
 
-    Match modes (mutually exclusive, in priority order):
-
-    * ``regex=True`` — Python ``re.search`` over ``name`` and
-      ``qualified_name``. O(n) over indexed rows in scope (partial index
-      only covers rows with a non-NULL name), but n is small for the
-      usual case of a single project.
-    * ``exact=True`` — SQL equality. O(log n) via partial index.
-    * otherwise — SQL prefix (``LIKE 'name%'``). Uses the index too;
-      SQLite optimizes trailing-wildcard LIKE on BINARY-collated columns.
-
-    Returns :class:`SearchResult` with ``distance=0.0`` (unused). Caller
-    gets the same tuple shape as :func:`knowledge.search.search` so the
-    citations formatter works identically.
+    ``find`` is structurally identical across backends — every clause uses
+    plain SQL (LIKE, equality) that PG and SQLite execute the same way.
+    Only the parameter style differs, which :func:`db.fetch_all` hides.
     """
     if regex:
         return _find_regex(conn, name, project_id, kind, lang, limit)
@@ -68,9 +57,6 @@ def find(
         where.append("(c.name = ? OR c.qualified_name = ?)")
         params.extend([name, name])
     else:
-        # Prefix search. SQLite matches ``LIKE 'x%'`` against an index on
-        # BINARY-collated (default) columns. Escape wildcards in the
-        # user's input so a literal '%' doesn't silently over-match.
         escaped = _escape_like(name)
         where.append(
             "(c.name LIKE ? ESCAPE '\\' OR c.qualified_name LIKE ? ESCAPE '\\')"
@@ -87,8 +73,6 @@ def find(
         where.append("f.lang = ?")
         params.append(lang)
 
-    # Order: exact-name matches first, then qualified-name matches, then
-    # by chunk id for stability. Cheap, useful for human reading.
     sql = f"""
         SELECT {_CHUNK_COLS}
         FROM chunks c
@@ -99,8 +83,7 @@ def find(
         LIMIT ?
     """
     params.extend([name, limit])
-
-    rows = conn.execute(sql, params).fetchall()
+    rows = db.fetch_all(conn, sql, tuple(params))
     return [_row_to_result(r) for r in rows]
 
 
@@ -113,17 +96,28 @@ def grep(
     lang: str | None = None,
     limit: int = config.DEFAULT_TOP_K,
 ) -> list[SearchResult]:
-    """FTS5 MATCH over chunk text + symbol names.
+    """Lexical full-text match over chunk text + symbol names.
 
-    ``pattern`` is passed through to FTS5 directly, so the caller gets the
-    full FTS5 query syntax: quoted phrases, prefix ``foo*``, boolean
-    ``foo AND bar``, column qualifier ``name:foo``, etc.
-
-    Ranking is FTS5 default bm25 — most-relevant first.
+    SQLite path: passes ``pattern`` to FTS5 verbatim — caller gets the full
+    FTS5 syntax (phrases, prefix, AND/OR, column qualifiers).
+    PostgreSQL path: parses ``pattern`` into a tsquery via :func:`_to_tsquery`.
+    The PG syntax is more restricted — bare words become an OR query, and
+    quoted phrases become ``<->`` proximity queries. Caller doesn't have to
+    care unless they're using FTS5-only syntax that has no PG equivalent.
     """
-    # Over-fetch when post-filters are set — some MATCH hits will be
-    # dropped by project/kind/lang. 3x slack is usually enough; deep
-    # filters may still return under ``limit``.
+    if db.current_mode() == "postgresql":
+        return _grep_postgres(conn, pattern, project_id, kind, lang, limit)
+    return _grep_sqlite(conn, pattern, project_id, kind, lang, limit)
+
+
+def _grep_sqlite(
+    conn: Connection,
+    pattern: str,
+    project_id: int | None,
+    kind: str | None,
+    lang: str | None,
+    limit: int,
+) -> list[SearchResult]:
     k_fetch = limit * 3 if (project_id or kind or lang) else limit
 
     where: list[str] = ["chunks_fts MATCH ?"]
@@ -138,9 +132,6 @@ def grep(
         where.append("f.lang = ?")
         params.append(lang)
 
-    # bm25(chunks_fts) — lower rank = better match, so ORDER BY ASC.
-    # Use the ``rank`` auxiliary column (FTS5 default BM25) so we don't
-    # fight the order of user-supplied filters.
     sql = f"""
         SELECT {_CHUNK_COLS}
         FROM chunks_fts
@@ -152,14 +143,97 @@ def grep(
         LIMIT ?
     """
     params.append(k_fetch)
-
     rows = conn.execute(sql, params).fetchall()
     return [_row_to_result(r) for r in rows[:limit]]
+
+
+def _grep_postgres(
+    conn: Connection,
+    pattern: str,
+    project_id: int | None,
+    kind: str | None,
+    lang: str | None,
+    limit: int,
+) -> list[SearchResult]:
+    tsquery = _to_tsquery(pattern)
+    if not tsquery:
+        return []
+    k_fetch = limit * 3 if (project_id or kind or lang) else limit
+
+    where: list[str] = ["c.search_vector @@ to_tsquery('english', %s)"]
+    params: list = [tsquery]
+    if project_id is not None:
+        where.append("c.project_id = %s")
+        params.append(project_id)
+    if kind:
+        where.append("c.kind = %s")
+        params.append(kind)
+    if lang:
+        where.append("f.lang = %s")
+        params.append(lang)
+
+    sql = f"""
+        SELECT {_CHUNK_COLS},
+               ts_rank_cd(c.search_vector, to_tsquery('english', %s)) AS rank
+        FROM chunks c
+        JOIN files    f ON f.id = c.file_id
+        JOIN projects p ON p.id = c.project_id
+        WHERE {' AND '.join(where)}
+        ORDER BY rank DESC
+        LIMIT %s
+    """
+    # tsquery bound twice — once for the WHERE @@ filter, once for the
+    # ts_rank_cd column. Same trick as the vector search: param binds for
+    # the filter and the projection are independent.
+    params = [tsquery, *params, k_fetch]
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    # Trim ``rank`` so the row shape matches _CHUNK_COLS (the SearchResult
+    # builder doesn't store rank — we only used it for ORDER BY).
+    return [_row_to_result(r[:11]) for r in rows[:limit]]
 
 
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+def _to_tsquery(pattern: str) -> str:
+    """Best-effort tsquery from an FTS5-shaped pattern.
+
+    PG's tsquery wants ``foo & bar`` (AND), ``foo | bar`` (OR), ``foo:*``
+    (prefix), or ``foo <-> bar`` (proximity). We support a useful subset:
+
+    * Quoted phrases ``"foo bar"`` → ``foo <-> bar``
+    * Bare words → joined with ``|`` (OR — better recall for free-text)
+    * Trailing ``*`` → tsquery prefix ``foo:*``
+    * FTS5-only constructs (column qualifiers ``name:foo``, ``AND``/``OR``
+      keywords) are not translated; callers using those on PG get an
+      empty result (better than corrupted ranking).
+    """
+    pattern = pattern.strip()
+    if not pattern:
+        return ""
+
+    # Pull out quoted phrases first so their internal spaces don't get
+    # confused with the OR-join below.
+    phrases = re.findall(r'"([^"]+)"', pattern)
+    rest = re.sub(r'"[^"]+"', " ", pattern)
+
+    parts: list[str] = []
+    for phrase in phrases:
+        words = re.findall(r"\w+", phrase)
+        if words:
+            parts.append(" <-> ".join(words))
+
+    for tok in re.findall(r"[A-Za-z0-9_]+\*?", rest):
+        if tok.endswith("*") and len(tok) > 1:
+            parts.append(f"{tok[:-1]}:*")
+        elif len(tok) >= 2:
+            parts.append(tok)
+
+    return " | ".join(parts)
 
 
 def _find_regex(
@@ -170,13 +244,7 @@ def _find_regex(
     lang: str | None,
     limit: int,
 ) -> list[SearchResult]:
-    """Python-side regex filter.
-
-    SQLite REGEXP needs a user-registered function; we avoid the
-    connection-setup coupling by pulling candidate rows (scoped to
-    non-NULL name via the partial index) and filtering in Python.
-    Still fast in practice — the index keeps row counts low.
-    """
+    """Python-side regex filter — backend-agnostic (rows returned via fetch_all)."""
     try:
         rx = re.compile(pattern)
     except re.error as exc:
@@ -203,7 +271,7 @@ def _find_regex(
         ORDER BY c.id ASC
     """
     out: list[SearchResult] = []
-    for row in conn.execute(sql, params):
+    for row in db.fetch_all(conn, sql, tuple(params)):
         name, qname = row[2], row[3]
         if (name and rx.search(name)) or (qname and rx.search(qname)):
             out.append(_row_to_result(row))
@@ -218,7 +286,6 @@ def _escape_like(s: str) -> str:
 
 
 def _row_to_result(r) -> SearchResult:
-    """Shape a row matching ``_CHUNK_COLS`` as a :class:`SearchResult`."""
     return SearchResult(
         chunk_id=r[0],
         kind=r[1],

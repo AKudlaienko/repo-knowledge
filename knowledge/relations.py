@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+from . import db as _db
 from .db import Connection
 from .resolvers import Edge, dispatch_resolver
 
@@ -123,10 +124,11 @@ class FileIndex:
 
     @classmethod
     def load(cls, conn: Connection, project_id: int, root: Path) -> "FileIndex":
-        rows = conn.execute(
+        rows = _db.fetch_all(
+            conn,
             "SELECT id, rel_path FROM files WHERE project_id = ?",
             (project_id,),
-        ).fetchall()
+        )
         return cls(
             project_id=project_id,
             root=root,
@@ -216,7 +218,8 @@ def wipe_file(conn: Connection, source_file_id: int) -> None:
     implicitly by :func:`insert_edges` — callers normally don't invoke
     this directly.
     """
-    conn.execute(
+    _db.execute(
+        conn,
         "DELETE FROM file_edges WHERE source_file_id = ?",
         (source_file_id,),
     )
@@ -305,7 +308,8 @@ def insert_edges(
         if e.kind == "ansible_module" and target_id is None:
             continue
 
-        conn.execute(
+        _db.execute(
+            conn,
             "INSERT INTO file_edges("
             "project_id, source_file_id, target_file_id, kind, raw, symbol, line"
             ") VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1071,11 +1075,12 @@ def _load_project_variables(
     shape ``FileIndex.variables`` expects. Empty when the table has no
     rows for this project — callers treat empty as "no substitution".
     """
-    rows = conn.execute(
+    rows = _db.fetch_all(
+        conn,
         "SELECT scope, name, value FROM project_variables "
         "WHERE project_id = ?",
         (project_id,),
-    ).fetchall()
+    )
     out: dict[str, dict[str, str]] = {}
     for scope, name, value in rows:
         out.setdefault(scope, {})[name] = value
@@ -1235,7 +1240,8 @@ def get_forward(
         if not frontier:
             break
         placeholders = ",".join("?" * len(frontier))
-        rows = conn.execute(
+        rows = _db.fetch_all(
+            conn,
             f"""
             SELECT e.source_file_id, sf.rel_path,
                    e.target_file_id,  tf.rel_path,
@@ -1246,8 +1252,8 @@ def get_forward(
             WHERE e.source_file_id IN ({placeholders})
             ORDER BY sf.rel_path, e.line, e.raw
             """,
-            frontier,
-        ).fetchall()
+            tuple(frontier),
+        )
 
         next_frontier: list[int] = []
         for r in rows:
@@ -1285,7 +1291,8 @@ def get_reverse(
         if not frontier:
             break
         placeholders = ",".join("?" * len(frontier))
-        rows = conn.execute(
+        rows = _db.fetch_all(
+            conn,
             f"""
             SELECT e.source_file_id, sf.rel_path,
                    e.target_file_id,  tf.rel_path,
@@ -1296,8 +1303,8 @@ def get_reverse(
             WHERE e.target_file_id IN ({placeholders})
             ORDER BY sf.rel_path, e.line
             """,
-            frontier,
-        ).fetchall()
+            tuple(frontier),
+        )
 
         next_frontier: list[int] = []
         for r in rows:
@@ -1331,30 +1338,35 @@ def stats(conn: Connection, project_id: int | None = None) -> dict:
         proj_clause = "WHERE project_id = ?"
         params = (project_id,)
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM file_edges {proj_clause}", params
-    ).fetchone()[0]
-    resolved = conn.execute(
+    total = _db.fetch_one(
+        conn,
+        f"SELECT COUNT(*) FROM file_edges {proj_clause}",
+        params,
+    )[0]
+    resolved = _db.fetch_one(
+        conn,
         f"SELECT COUNT(*) FROM file_edges "
         f"{proj_clause} {'AND' if proj_clause else 'WHERE'} "
         f"target_file_id IS NOT NULL",
         params,
-    ).fetchone()[0]
+    )[0]
     # Parametric = NULL target AND kind != 'unresolved' AND raw carries
     # template markers. Done in SQL via ``LIKE`` rather than the
     # more precise ``has_template_markers`` regex — good enough for
     # counting and avoids pulling every row into Python.
-    parametric = conn.execute(
+    parametric = _db.fetch_one(
+        conn,
         f"SELECT COUNT(*) FROM file_edges "
         f"{proj_clause} {'AND' if proj_clause else 'WHERE'} "
         f"target_file_id IS NULL AND kind != 'unresolved' "
         f"AND (raw LIKE '%{{{{%' OR raw LIKE '%${{var.%')",
         params,
-    ).fetchone()[0]
-    by_kind_rows = conn.execute(
+    )[0]
+    by_kind_rows = _db.fetch_all(
+        conn,
         f"SELECT kind, COUNT(*) FROM file_edges {proj_clause} GROUP BY kind",
         params,
-    ).fetchall()
+    )
 
     by_kind = {k: c for k, c in by_kind_rows}
     unresolved = by_kind.get("unresolved", 0)
@@ -1377,10 +1389,11 @@ def find_file_id(
     rel_path: str,
 ) -> int | None:
     """Look up a file's id by its project-relative path. None if missing."""
-    row = conn.execute(
+    row = _db.fetch_one(
+        conn,
         "SELECT id FROM files WHERE project_id = ? AND rel_path = ?",
         (project_id, rel_path),
-    ).fetchone()
+    )
     return row[0] if row else None
 
 

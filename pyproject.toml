@@ -34,9 +34,23 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov"]
+# Shared PostgreSQL backend (storage.mode = "shared_postgresql"). Optional;
+# the default sqlite path needs none of these. psycopg[binary] ships wheels
+# for macOS/Linux so users don't need libpq dev headers.
+postgres = ["psycopg[binary]>=3.2", "pgvector>=0.3"]
 
 [project.scripts]
 knowledge = "knowledge.cli:main"
 
 [tool.setuptools]
-packages = ["knowledge", "knowledge.chunkers"]
+packages = [
+    "knowledge",
+    "knowledge.chunkers",
+    "knowledge.backends",
+    "knowledge.migrate",
+    "knowledge.schema",
+    "knowledge.schema.postgres",
+]
+
+[tool.setuptools.package-data]
+"knowledge.schema.postgres" = ["*.sql"]
