@@ -1,6 +1,6 @@
 # repo-knowledge
 
-Local semantic code search. One SQLite DB at `~/.knowledge/index.sqlite` holds chunks + embeddings for many repos. Respects `.gitignore`, scrubs a short list of secret patterns, no external services.
+Local semantic code search. Default storage is a single SQLite DB at `~/.knowledge/index.sqlite` holding chunks + embeddings for many repos. Optional **shared PostgreSQL mode** routes a project (or all of them) to a team-shared pgvector database — opt in per repo with a `.knowledge.yaml`. Respects `.gitignore`, scrubs a short list of secret patterns, no external services beyond the DB you point it at.
 
 Answers *meaning* questions: "how does vault auth work", "where is the ingress load balancer defined", "find the function that handles cert regeneration".
 
@@ -87,9 +87,9 @@ If `knowledge` lives in a venv (`which knowledge` points at something like `/Use
 You can switch modes any time — re-run `install-hooks` with or without `--absolute`; the in-place upgrade rewrites existing entries cleanly.
 
 **Verify the flow:**
-1. Append a JSON entry to `~/.knowledge/stage/pending.jsonl` during a running Claude Code session.
+1. Run `knowledge history stage --short "..." --long "..."` during a Claude Code session. This appends to `~/.knowledge/stage/<project-slug>/sess-<session-id>.jsonl` — isolated per project and per session so concurrent Claude instances can't clobber each other's staged work.
 2. Run `/compact` (or let auto-compact fire).
-3. `knowledge history recent --limit 1` — the entry should be in the DB and the stage file truncated to zero bytes.
+3. `knowledge history recent --limit 1` — the entry should be in the DB and the per-session stage file gone (ingest deletes it after a successful flush).
 
 ## What's indexed
 
@@ -113,3 +113,63 @@ Plus `.gitignore` + `.knowledgeignore` are honored, so gitignored files (where s
 ## Layout
 
 See `knowledge/README.md` for the module mapping table.
+
+## Shared PostgreSQL mode
+
+Default storage is local SQLite — fine for solo work. Switch a project (or every project on the laptop) to a team-shared **pgvector** database when you want teammates to share the same index, history, and decisions.
+
+**Storage choice is per project.** The same machine can keep project A on shared PG and project B on local SQLite. Resolution at runtime:
+
+1. `KNOWLEDGE_DATABASE_URL` env (CI override) — full DSN, wins everything
+2. Walk cwd → cwd's parents looking for `.knowledge.yaml` — first match wins
+3. `$HOME/.knowledge.yaml` — laptop-wide default
+4. Built-in default: SQLite
+
+The same file name and schema at every scope ([template](knowledge/config.example.yaml)). The closer file wins.
+
+### Quick start (Docker dev container)
+
+```bash
+pip install -e '.[postgres]'                       # install psycopg + pgvector
+
+export KNOWLEDGE_PG_USER={your-user}
+export KNOWLEDGE_PG_PASSWORD=$(openssl rand -hex 16)
+make pg-run                                        # builds image, starts container, applies schema
+
+cd /path/to/your-repo
+knowledge config init --project                    # writes ./.knowledge.yaml from template
+$EDITOR .knowledge.yaml                            # mode=shared_postgresql, host=127.0.0.1, sslmode=disable
+
+knowledge config show                              # confirms which file is active + masked DSN
+knowledge db ping                                  # opens the DB, prints version + extension status
+
+knowledge db init-postgres                         # idempotent re-apply of the schema
+knowledge build                                    # first build greenfield on PG
+knowledge ask "..."                                # all verbs route to PG from this cwd
+```
+
+Alternative: drop the `.knowledge.yaml` at `$HOME` to make PG the laptop default for every project that doesn't override.
+
+### Migrating an existing SQLite project
+
+The local SQLite copy stays untouched — `migrate` only writes to the target.
+
+```bash
+knowledge db migrate --project <name|abs-path> --dry-run    # see the plan
+knowledge db migrate --project <name|abs-path>              # interactive confirm
+knowledge db migrate --project <name|abs-path> --yes        # scripts/CI
+
+knowledge forget <name> --sqlite-only                       # drop the local copy after verifying the PG one
+```
+
+`migrate` keys on the project's `git remote` URL (normalized: strip credentials, drop `.git`, lowercase host, ssh→https) so the same repo cloned at different paths on different laptops collapses to one row on PG. Falls back to `root_path` when there's no `.git`.
+
+### Credentials
+
+Never in `.knowledge.yaml`. Each laptop exports its own `KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD` ([template](knowledge/config.example.env)). The YAML carries env-var **names** only — committed configs can't leak secrets even if checked in.
+
+`KNOWLEDGE_DATABASE_URL` is the CI escape hatch (full libpq URL with credentials inline). Don't use it on laptops.
+
+### Plan + design notes
+
+`todo/01-postgresql-shared-mode.md` — schema, ID-remap, advisory lock strategy, identity rules.

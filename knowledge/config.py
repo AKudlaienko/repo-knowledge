@@ -1,15 +1,18 @@
 """All hardcoded constants live here.
 
-Anything that might be tuned by a user belongs in ``~/.knowledge/config.json``
-(loaded lazily on demand — not in this module).
+Anything that might be tuned by a user belongs in ``.knowledge.yaml``
+(per-project closer-wins or ``$HOME/.knowledge.yaml`` as the laptop
+default — see :mod:`knowledge.settings`). This module only holds
+build-time constants that the chunker/embedder/scanner depend on; they
+shouldn't change at runtime.
 """
 
 from __future__ import annotations
 
 # Schema + chunker versioning. Bump CHUNKER_VERSION when chunking rules change
 # in a way that invalidates existing chunks (forces rebuild via meta mismatch).
-SCHEMA_VERSION = "1"
-CHUNKER_VERSION = "1"
+SCHEMA_VERSION = "2"
+CHUNKER_VERSION = "2"
 
 # Embedding model. BAAI/bge-small-en-v1.5: 384-dim, ~130MB, strong MTEB
 # score for mixed code+text retrieval, 512-token window.
@@ -19,7 +22,7 @@ EMBEDDING_DIM = 384
 # Chunk size threshold. Above this, split into big_parent + big_subchunks.
 MAX_CHARS = 1500
 
-# RAM cache budget (bytes). Overridable via config.json.
+# RAM cache budget (bytes). Overridable via .knowledge.yaml (cache_bytes key).
 CACHE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # Scan defaults. User-repo overrides live in .knowledge.yaml.

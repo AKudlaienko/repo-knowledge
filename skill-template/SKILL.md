@@ -1,37 +1,215 @@
 ---
 name: knowledge
-description: Local semantic code search across the current repo. Auto-builds or updates the local index, then returns the exact chunks (function / class / ansible task / terraform resource / helm values / markdown section / …) that match the user's question. Use this instead of raw Grep when the query is about meaning ("how does X work", "where is Y configured") rather than exact strings.
-argument-hint: [query] [--kind K] [--lang L] [--all-projects]
+description: Local code cartography + semantic search for the current repo. Navigate (find / grep), orient (why / map / brief), search (ask — hybrid FTS+vector+rerank, cached), and remember across sessions (decide / resume). Auto-builds or updates the local index. Use BEFORE raw Grep / Read for anything meaning-shaped.
+argument-hint: [verb] [args]
 allowed-tools: Bash Read
 ---
 
-# /knowledge — Local semantic code search
+# /knowledge — Code cartography + semantic search + session memory
 
-Complements `Grep` (exact text) and `graphify` (structural dependencies) by answering *meaning* questions: "how does vault auth work", "where is the load balancer defined", "what generates the workload cluster manifest". One SQLite DB at `~/.knowledge/index.sqlite` holds chunks + embeddings for every repo the user has indexed.
+Default: one SQLite DB at `~/.knowledge/index.sqlite` holds chunks, edges, history, and decisions for every repo the user has indexed. **Team shared mode** (optional, per-project): drop a `.knowledge.yaml` (template at `knowledge/config.example.yaml`) in the repo root or in `$HOME` with `storage.mode: shared_postgresql`; closer-to-cwd file wins, so project A can live in shared PG while project B stays on local sqlite. Credentials are env-vars on each laptop (`KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD` — never commit values; see `knowledge/config.example.env`). Complements `Grep` (exact text) for meaning-shaped questions.
 
-## Auto-maintenance — run BEFORE searching
+## Priority directives — READ FIRST
 
-On every invocation, check + refresh the index for the current repo. These three steps run in order:
+These four rules apply on every invocation. They exist because they reduce tool-call count, prevent re-opening solved problems, and keep cross-session continuity intact.
 
-### 1. Check state
+1. **On a new session, run `knowledge resume` BEFORE any other tool** in this skill.  It returns last decisions + touched files + any un-ingested stage entries + hub files. ~1200 tokens, <200ms. Skip only when the user's very first message makes it obvious (e.g. a typo fix on a specific line).
+
+2. **Pre-change conflict check (MANDATORY before any plan or non-trivial change).** See the dedicated section below. The user has lost time to changes that re-opened already-solved problems because a new session had no memory of the prior fight. This check is non-negotiable — even when the request looks small.
+
+3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha). `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
+
+4. **Log non-obvious choices with `knowledge decide` as you make them, not at session end.** Each decision is embedded — `knowledge resume` surfaces the latest five every new session, and `knowledge decisions --search "<topic>"` finds older ones. A two-minute `decide` call today saves a 20-minute "why did we do this" excavation next week.
+
+## Pre-change conflict check (MANDATORY)
+
+Before drafting a plan, before writing/editing any file, and before each major step within a multi-step plan, query the index for prior decisions and incidents on the same topic. Sessions are weeks apart; the user will not remember every prior fight, and neither will you. The index does.
+
+**Required queries (run in parallel when possible):**
+
+1. `knowledge decisions --search "<topic>"` — prior `knowledge decide` entries on the same area.
+2. `knowledge history search "<topic>"` — past work-log entries: incidents, rollbacks, painful fixes.
+3. `knowledge relations <file>` for each file you intend to touch — hidden coupling that was likely the *reason* for an earlier decision.
+4. `knowledge ask "what did we decide / fix about <topic>?"` — semantic catch-all when the topic word is fuzzy.
+
+**STOP conditions — halt and surface to the user before continuing if ANY apply:**
+
+- The proposed change contradicts a prior `knowledge decide` entry.
+- The proposed change matches a pattern that previously caused an incident in `knowledge history` (e.g. "we tried this last month and it broke X").
+- The user's request appears to undo work captured in a recent `knowledge history` milestone.
+- The change touches a hub file or high-blast-radius file with no prior decision context (ask before proceeding).
+
+**Required warning format when stopping** (do not silently push through):
+
+> ⚠️ **Conflict with prior knowledge — stopping before change**
+> - **Decision** `<topic>` (`<date>`): `<one-line summary>` — *Reason given:* `<why>`
+> - **History** `<id>` (`<date>`): `<one-line summary of what happened / what was fixed>`
+> - **Why this matters now**: `<concrete reason the proposed change re-opens the same problem>`
+> - **Options**:
+>   1. Proceed and supersede the prior decision — I will record a new `knowledge decide` explaining the reversal.
+>   2. Adapt the plan to honor the prior decision (preferred default).
+>   3. Need clarification from you.
+
+If the user explicitly chooses (1), record a new `knowledge decide` referencing and superseding the old one as part of the change. Never overwrite history silently.
+
+## Finding code — intent → verb
+
+| Intent | Use |
+|--------|-----|
+| Unfamiliar repo | **`knowledge brief`**, then `knowledge map` |
+| Meaning / "how does X" / "where is Y" | **`knowledge ask "<question>"`** (default — not `search`) |
+| Known symbol | **`knowledge find <name>`** |
+| Exact phrase / keyword | **`knowledge grep '<pattern>'`** |
+| One file before Read | **`knowledge why <path>`** |
+| Imports / callers / blast radius | **`knowledge relations <file>`** before `ask` |
+| Continue prior work | **`knowledge history recent`** or `knowledge decisions --search "<topic>"` |
+
+Only after these return paths and line ranges: **Read** those slices. Built-in **Grep**/**Glob** only on paths the index has already narrowed — never as the first repo-wide step.
+
+### Prohibited
+
+- Repository-wide **Grep**, **Glob**, or **Task**/`explore` subagents as the **first** step for meaning-shaped questions.
+- Speculative reads of whole trees or large files.
+- **`knowledge search`** for normal Q&A — use **`knowledge ask`**.
+
+### Escalation order
+
+`knowledge` (resume → status → relations / ask / find / grep / why) → `docs/` → targeted **Read** → **Grep**/**Glob** only on a path the index already returned.
+
+## Auto-maintenance — run BEFORE any query verb
 
 ```bash
 knowledge status --json
 ```
 
-Reads the `state` field from the JSON: one of `missing`, `stale`, `fresh`. Exit codes are also usable (2, 1, 0 respectively) — whichever is handier.
+Branch on `state`:
+- `missing` → `knowledge build` (first-time: 1–5 min for embedding model + initial encode; warn the user).
+- `stale`   → `knowledge update` (usually <5s; only re-embeds chunks whose sanitized text changed).
+- `fresh`   → go straight to your query verb.
 
-### 2. Build or update as needed
+## Storage routing — where does my data live?
 
-- `state: missing` → index doesn't exist for this repo yet. Run `knowledge build` and warn the user that first-time indexing takes 1-5 minutes (mostly embedding model load + initial encode).
-- `state: stale` → files changed since last index. Run `knowledge update` silently (usually finishes in under 5s; only re-embeds chunks whose post-sanitize text actually changed).
-- `state: fresh` → skip, go straight to search.
+The skill talks to whichever backend the current cwd resolves to. Resolution order:
 
-### 3. Run the search
+1. `KNOWLEDGE_DATABASE_URL` env (CI override) — full DSN, wins everything.
+2. Walk cwd → its parents looking for `.knowledge.yaml` — first match wins.
+3. `$HOME/.knowledge.yaml` — laptop-wide default.
+4. Built-in default: SQLite at `~/.knowledge/index.sqlite`.
+
+Same name + same YAML schema at every scope; the closer file wins, so project A on shared PG and project B on local SQLite is fine on the same laptop. Two ways to check what's active right now:
+
+```bash
+knowledge config show         # mode + masked DSN + which file is active
+knowledge db ping             # opens the connection, version + schema status (read-only)
+```
+
+When a verb fails with `psycopg.ProgrammingError` or `missing PostgreSQL credentials` — first thing to do is `knowledge config show` and `knowledge config check-env`. Credentials live only in env (`KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD`), never in any committed file.
+
+For migrating an existing local-SQLite project to a PG container, use `knowledge db migrate --project <name> --dry-run` to preview, then drop `--dry-run`. The local SQLite copy is never modified.
+
+## The six agent-speed verbs
+
+These bypass the embedding model entirely (`find`, `grep`) or cache their answers (`ask`). Prefer them over reading raw files for meaning questions.
+
+### `find <name>` — exact/prefix/regex symbol lookup
+
+```bash
+knowledge find VaultClient --exact          # SQL equality on name / qualified_name
+knowledge find regen --kind ansible_task    # prefix (default), filtered to Ansible tasks
+knowledge find '^handle_' --regex           # Python regex — use flags like (?i) for case
+```
+
+Under 10ms. Use when you know a symbol name and want its source location.
+
+### `grep <pattern>` — FTS5 full-text match
+
+```bash
+knowledge grep 'helm install'
+knowledge grep '"exact phrase"'                # phrase search
+knowledge grep 'vault AND approle'             # boolean
+knowledge grep 'name:VaultClient'              # column qualifier
+knowledge grep 'regenerate*' --kind ansible_task
+```
+
+Full FTS5 query syntax. Tokens-only index (no embedder). Use for lexical precision.
+
+### `ask <question>` — hybrid semantic + lexical (the default)
+
+```bash
+knowledge ask "how does vault auto_load inject secrets"
+knowledge ask "octavia LB floating IP" --top-k 5
+knowledge ask "cert regen" --budget 2000           # soft token budget for citation list
+knowledge ask "<question>" --no-cache              # force fresh (skip 1h cache)
+```
+
+RRF merge of vec + FTS, reranked by last-30d git, current session stage, and import-graph hub in-degree. Cached per (query, HEAD sha) with 1h TTL; invalidated in the same txn whenever the indexer mutates a chunk.
+
+### `why <path>` — one-file brief
+
+```bash
+knowledge why ansible/roles/karmada/tasks/main.yml
+knowledge why python_packages/kickstart/utils.py
+```
+
+Returns: lang/loc/last-commit-date, first description line, top 5 symbols by size, top 3 inbound + outbound edges. ~100ms. Use to orient on a file before reading it.
+
+### `map [--dir PATH] [--depth N]` — directory overview
+
+```bash
+knowledge map --depth 2                     # whole repo
+knowledge map --dir terraform --depth 3     # one subtree
+```
+
+Per-dir: file count, dominant language, top 3 non-structural chunk kinds, highest-in-degree "entrypoint" file. Truncates at 200 rows.
+
+### `brief` — repo-wide snapshot
+
+```bash
+knowledge brief
+```
+
+Totals, top 5 langs, top 10 hub files by in-degree. Run once on unfamiliar repos to build a mental model before asking specific questions.
+
+## Session memory — `decide` + `resume`
+
+See the priority directives above. Full detail:
+
+### `decide` — record a non-obvious choice
+
+```bash
+knowledge decide "cache invalidation" \
+  --decision "wipe per-project on any chunk change; preserve on no-op update" \
+  --rationale "agent-driven updates on every turn shouldn't thrash cache" \
+  --files knowledge/query_cache.py knowledge/indexer.py
+```
+
+Topic + decision are the keys. Rationale and file list are optional but valuable — the rationale is what future-you actually needs to remember.
+
+### `decisions` — list or semantically search
+
+```bash
+knowledge decisions --limit 5
+knowledge decisions --topic cache              # substring filter on topic
+knowledge decisions --search "how to handle stale caches"   # semantic over topic+decision
+```
+
+### `resume` — the session-start brief
+
+```bash
+knowledge resume
+```
+
+Four blocks in order: last 5 decisions, 10 most-touched files (7d), un-ingested stage entries, top 3 hub files. ~1200 tokens, idempotent. Run first on every new session.
+
+## `search` — raw-chunks flow (legacy / specialist use)
+
+Kept for when you need ranked vector results without RRF/rerank/cache — e.g. comparing distances, piping to downstream code, or debugging retrieval.
 
 ```bash
 knowledge search "$ENRICHED_QUERY" [--kind K] [--lang L] [--top-k 10]
 ```
+
+For normal agent use, prefer `ask`.
 
 ## Query enrichment — rewrite the user's question before searching
 
@@ -96,16 +274,21 @@ knowledge path <chunk_id>                      # file_path:start_line-end_line
 
 User: "how does the karmada cert regeneration ansible task work"
 
-1. `knowledge status --json` → `{"state": "fresh", ...}` → no maintenance needed
-2. Rewrite to `ansible task: karmada cert regeneration`
-3. `knowledge search "ansible task: karmada cert regeneration" --kind ansible_task --top-k 5`
-4. Top result: `Regenerate Karmada TLS certificates (ansible/roles/karmada/tasks/main.yml:47-55)` with `chunk_id=682`
-5. Optionally `knowledge get 682 --raw` to show the original YAML
-6. Summarize for the user referencing `ansible/roles/karmada/tasks/main.yml:47`
+1. New session → `knowledge resume` to load prior context.
+2. `knowledge status --json` → `{"state": "fresh", ...}` → no maintenance needed
+3. `knowledge ask "karmada cert regeneration" --kind ansible_task --top-k 5`
+4. Top result: `ansible/roles/karmada/tasks/main.yml:47-55 | ansible_task | name: Regenerate Karmada TLS certificates`
+5. `knowledge why ansible/roles/karmada/tasks/regenerate_certs.yml` for the included file's neighbors.
+6. Summarize for the user referencing `ansible/roles/karmada/tasks/main.yml:47`.
+7. If this invoked a non-obvious design choice, `knowledge decide "karmada cert rotation approach" --decision "..." --files ansible/roles/karmada/tasks/regenerate_certs.yml`.
 
 ## Continuity / memory — cross-session RAG over past work
 
-Alongside code chunks, this tool stores per-project **work summaries** (short + long pairs) so a new session can pick up where the last one left off without re-reading the prior transcript. Two-tier retrieval: semantic search over short summaries, drill into the long summary of a specific hit when details are needed.
+Two complementary stores:
+- **History** (`knowledge history stage|ingest|recent|search`) — free-form work summaries keyed by session/time. Good for "what did we do last Tuesday."
+- **Decisions** (`knowledge decide|decisions|resume`) — structured choices with topic/decision/rationale/files. Good for "why did we pick X over Y."
+
+Use **history** for narrative, **decisions** for commitments. `resume` aggregates both plus git and staging state into one session-start brief.
 
 ### Session start — check what we did before
 
@@ -123,13 +306,19 @@ Skip history lookup entirely when the question is clearly about current code ("w
 
 ### During the session — write staged entries at natural boundaries
 
-At each unit-of-work completion (task done, plan signed off, a focused change shipped), **append one JSON line** to `~/.knowledge/stage/pending.jsonl`. You do NOT re-read the file — a Python helper (`knowledge history ingest`) handles parsing and DB insert later. This avoids burning tokens on re-reading your own summaries.
+At each unit-of-work completion (task done, plan signed off, a focused change shipped), run **one `knowledge history stage` command** per entry:
 
-Format (one object per line, unknown keys ignored):
+```bash
+knowledge history stage \
+  --short "Fixed ambiguous project-name resolution in forget/search." \
+  --long  "Added AmbiguousProjectName exception in projects.py. resolve_project now uses fetchall() on the name branch and raises on >1 match. cmd_search and cmd_forget catch and dispatch to _print_ambiguous. Fixes the silent-pick-one behavior.
 
-```json
-{"short": "Fixed ambiguous project-name resolution in forget/search.", "long": "Added AmbiguousProjectName exception in projects.py. resolve_project now uses fetchall() on the name branch and raises on >1 match. cmd_search and cmd_forget catch and dispatch to _print_ambiguous. Fixes the silent-pick-one behavior.\n\nFiles: knowledge/projects.py, knowledge/cli.py.\nDecision: keep error-out semantics rather than auto-pick — ambiguity should be user-resolved.", "tags": "fix,cli,projects"}
+Files: knowledge/projects.py, knowledge/cli.py.
+Decision: keep error-out semantics rather than auto-pick — ambiguity should be user-resolved." \
+  --tags "fix,cli,projects"
 ```
+
+This appends one JSONL line to `~/.knowledge/stage/<project-slug>/sess-<session-id>.jsonl` — isolated per project (via a SHA-1-suffixed slug of the repo root) and per session (via `CLAUDE_SESSION_ID` when present, falling back to `pid<PID>-<epoch>`). You do NOT re-read the file; `knowledge history ingest` handles parsing and DB insert later, which avoids burning tokens on re-reading your own summaries.
 
 Guidelines:
 - **Short** ≤ ~160 chars. The imperative-summary bar: someone skimming `recent` should know what happened. One line.
@@ -143,17 +332,18 @@ Guidelines:
 Run `knowledge history ingest` when you want to durably persist staged entries:
 
 ```bash
-knowledge history ingest                                # default path
-knowledge history ingest --stage-file /path/to/x.jsonl  # override
+knowledge history ingest                                # walks all per-project stage dirs
+knowledge history ingest --stage-file /path/to/x.jsonl  # override: flush one file under current project
 ```
 
-Behavior:
-- Reads all JSONL lines, embeds the short summaries in one batch, inserts rows transactionally.
-- On SQL success → truncates the stage file to zero bytes.
-- On SQL failure → leaves the file intact; new entries can still be appended and a later ingest will pick up everything.
-- Malformed lines (bad JSON, missing short/long, empty short) are skipped and counted in the output; they do **not** block the valid entries.
+Behavior (default flow):
+- Walks every `~/.knowledge/stage/<slug>/` dir and processes each `sess-*.jsonl` file under its own APSW savepoint.
+- Each file is atomically renamed to `*.inflight-<pid>-<ts>` before it's read — so three near-simultaneous hook firings (Stop, PreCompact, SessionEnd) can't double-ingest the same file. The winning process deletes the inflight file on commit; any loser skips silently.
+- Embeds short summaries in one batch per file and inserts rows transactionally.
+- Malformed lines (bad JSON, missing short/long, empty short) are skipped and counted; they do **not** block the valid entries or other files.
+- A one-shot migration absorbs the legacy `~/.knowledge/stage/pending.jsonl` (from earlier versions) under the current project, then deletes it.
 
-**When to ingest:** after a batch of entries (e.g. end of a focused work stretch), or before a context-window compact event. In Phase 2 a `PreCompact` hook will do this automatically; for now, it's explicit.
+**When to ingest:** after a batch of entries (e.g. end of a focused work stretch), or before a context-window compact event. A `PreCompact`/`Stop`/`SessionEnd` hook (installed by `knowledge install-hooks`) does this automatically; manual invocation is still fine.
 
 ### Rules for history
 

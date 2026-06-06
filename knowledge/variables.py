@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
+from . import db
 from .db import Connection
 
 
@@ -45,7 +46,7 @@ VALID_SCOPES: frozenset[str] = frozenset({"ansible", "terraform", "helm", "all"}
 # access like ``{{ foo.bar }}`` or ``{{ foo[0] }}`` doesn't match —
 # those are almost never used for static path construction.
 _JINJA_VAR_RE = re.compile(
-    r"\{\{\s*([a-zA-Z_]\w*)(?:\s*\|[^}]+)?\s*\}\}"
+    r"\{\{-?\s*([a-zA-Z_]\w*)(?:\s*\|[^}]+?)?\s*-?\}\}"
 )
 
 # ``${var.name}`` — Terraform's interpolation for ``variable`` blocks.
@@ -97,12 +98,13 @@ def set_many(
     if not pairs:
         return 0
     now = time.time()
-    with conn:
+    with db.transaction(conn):
         for name, value in pairs.items():
             _validate_name(name)
             if not isinstance(value, str):
                 value = str(value)
-            conn.execute(
+            db.execute(
+                conn,
                 "INSERT INTO project_variables("
                 "project_id, scope, name, value, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?) "
@@ -121,16 +123,13 @@ def unset(
 ) -> bool:
     """Delete one row. Returns True if a row existed."""
     _validate_scope(scope)
-    conn.execute(
+    deleted = db.execute(
+        conn,
         "DELETE FROM project_variables "
         "WHERE project_id = ? AND scope = ? AND name = ?",
         (project_id, scope, name),
     )
-    # APSW's Cursor exposes ``changes()`` on the connection; the cursor
-    # itself doesn't have an execute-returned changes() in all versions.
-    # Use conn.changes() which reports the most recent statement's row
-    # count — sufficient since we don't interleave other ops.
-    return conn.changes() > 0
+    return deleted > 0
 
 
 def unset_scope(
@@ -140,11 +139,11 @@ def unset_scope(
 ) -> int:
     """Delete every row in ``scope``. Returns deleted count."""
     _validate_scope(scope)
-    conn.execute(
+    return db.execute(
+        conn,
         "DELETE FROM project_variables WHERE project_id = ? AND scope = ?",
         (project_id, scope),
     )
-    return conn.changes()
 
 
 def list_vars(
@@ -158,17 +157,19 @@ def list_vars(
     """
     if scope is not None:
         _validate_scope(scope)
-        rows = conn.execute(
+        rows = db.fetch_all(
+            conn,
             "SELECT scope, name, value, updated_at FROM project_variables "
             "WHERE project_id = ? AND scope = ? ORDER BY name",
             (project_id, scope),
-        ).fetchall()
+        )
     else:
-        rows = conn.execute(
+        rows = db.fetch_all(
+            conn,
             "SELECT scope, name, value, updated_at FROM project_variables "
             "WHERE project_id = ? ORDER BY scope, name",
             (project_id,),
-        ).fetchall()
+        )
     return [Variable(*r) for r in rows]
 
 
@@ -309,11 +310,12 @@ def apply_variables(
     # re-resolve helm_includes during the apply pass).
     index.prepare([], conn=conn)
 
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         "SELECT id, source_file_id, kind, raw, symbol, target_file_id "
         "FROM file_edges WHERE project_id = ?",
         (project_id,),
-    ).fetchall()
+    )
 
     # Pre-load source-file rel_paths for the edges we might touch.
     # An edge is "touchable" if its raw OR symbol carries templates —
@@ -331,10 +333,11 @@ def apply_variables(
     placeholders = ",".join("?" * len(src_ids))
     src_rel_by_id: dict[int, str] = {
         fid: rel
-        for fid, rel in conn.execute(
+        for fid, rel in db.fetch_all(
+            conn,
             f"SELECT id, rel_path FROM files WHERE id IN ({placeholders})",
-            list(src_ids),
-        ).fetchall()
+            tuple(src_ids),
+        )
     }
 
     updated = 0
@@ -396,7 +399,8 @@ def apply_variables(
                 still_parametric += 1
             continue
 
-        conn.execute(
+        db.execute(
+            conn,
             "UPDATE file_edges SET target_file_id = ?, kind = ? WHERE id = ?",
             (new_target, new_kind, edge_id),
         )

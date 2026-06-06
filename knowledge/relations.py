@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+from . import db as _db
 from .db import Connection
 from .resolvers import Edge, dispatch_resolver
 
@@ -112,12 +113,22 @@ class FileIndex:
     # ``${var.name}`` — see ``variables.substitute``.
     variables: dict[str, dict[str, str]] = field(default_factory=dict)
 
+    # Terraform declarations, scoped by directory (the terraform-root
+    # boundary). Outer key = directory posix path (``terraform/live/.../dev``,
+    # ``""`` for project root); inner key = declaration string
+    # (``var.NAME`` / ``local.NAME`` / ``module.NAME``); value = file_id.
+    # Populated in prepare() from the tf_decl edges resolvers emit during
+    # extraction. Consulted by _resolve_terraform to target var/local/
+    # module references to their declaration file.
+    tf_decls: dict[str, dict[str, int]] = field(default_factory=dict)
+
     @classmethod
     def load(cls, conn: Connection, project_id: int, root: Path) -> "FileIndex":
-        rows = conn.execute(
+        rows = _db.fetch_all(
+            conn,
             "SELECT id, rel_path FROM files WHERE project_id = ?",
             (project_id,),
-        ).fetchall()
+        )
         return cls(
             project_id=project_id,
             root=root,
@@ -178,6 +189,12 @@ class FileIndex:
         # ``helm_define`` edges the resolver produced during extraction.
         self.helm_templates = _collect_helm_defines(pending)
 
+        # Terraform: per-directory declaration-name → file_id map, built
+        # from the tf_decl edges the resolver emitted. Directory scope
+        # mirrors Terraform's compilation-unit rule (every .tf in one
+        # directory shares a single namespace).
+        self.tf_decls = _collect_tf_decls(pending)
+
         # Project variables (Jinja / Terraform substitution source).
         # ``conn`` is optional so callers outside the build/update flow
         # (e.g. unit tests) can skip loading. An empty dict disables
@@ -201,7 +218,8 @@ def wipe_file(conn: Connection, source_file_id: int) -> None:
     implicitly by :func:`insert_edges` — callers normally don't invoke
     this directly.
     """
-    conn.execute(
+    _db.execute(
+        conn,
         "DELETE FROM file_edges WHERE source_file_id = ?",
         (source_file_id,),
     )
@@ -222,10 +240,13 @@ def extract_edges(
     bubble up; callers can catch to skip one bad file without failing
     the whole batch.
     """
-    resolver = dispatch_resolver(lang, abs_path)
-    if resolver is None:
+    resolvers = dispatch_resolver(lang, abs_path)
+    if not resolvers:
         return []
-    return resolver.extract(raw_bytes, abs_path)
+    edges: list[Edge] = []
+    for resolver in resolvers:
+        edges.extend(resolver.extract(raw_bytes, abs_path))
+    return edges
 
 
 def insert_edges(
@@ -255,8 +276,10 @@ def insert_edges(
     inserted = 0
     for e in edges:
         # ``helm_define`` is metadata consumed by FileIndex.prepare, not
-        # a real dependency. Drop without persisting.
-        if e.kind == "helm_define":
+        # a real dependency. Drop without persisting. ``tf_decl`` is the
+        # Terraform analogue — consumed by prepare() to build tf_decls,
+        # never written to file_edges.
+        if e.kind in ("helm_define", "tf_decl"):
             continue
 
         if e.kind == "unresolved" or resolver_fn is None:
@@ -285,7 +308,8 @@ def insert_edges(
         if e.kind == "ansible_module" and target_id is None:
             continue
 
-        conn.execute(
+        _db.execute(
+            conn,
             "INSERT INTO file_edges("
             "project_id, source_file_id, target_file_id, kind, raw, symbol, line"
             ") VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -411,19 +435,30 @@ def _resolve_js(edge: Edge, index: FileIndex, source_rel: str) -> int | None:
 def _resolve_terraform(
     edge: Edge, index: FileIndex, source_rel: str
 ) -> int | None:
-    """Resolve one of ``tf_module`` / ``tf_templatefile`` / ``tf_file``.
+    """Resolve Terraform edges.
 
-    All three share the same resolution rule: the ``raw`` string, after
-    stripping an optional ``${path.module}/`` prefix, is either absolute
-    (URL, registry, ``git::`` — never a project file) or a POSIX path
-    relative to the source file's directory. Modules resolve to a
-    **directory** in the files table, which we approximate by looking
-    for a sibling ``.tf`` file at that path (any .tf in the module dir
-    works as a target — we pick the canonical ``main.tf`` first).
+    ``tf_module`` / ``tf_templatefile`` / ``tf_file`` share a path-based
+    rule: the ``raw`` string, after stripping an optional
+    ``${path.module}/`` prefix, is either absolute (URL, registry,
+    ``git::`` — never a project file) or a POSIX path relative to the
+    source file's directory. Modules resolve to a **directory** in the
+    files table, which we approximate by looking for a sibling ``.tf``
+    file at that path (any .tf in the module dir works — we pick the
+    canonical ``main.tf`` first).
+
+    ``tf_var_ref`` / ``tf_local_ref`` / ``tf_module_ref`` resolve through
+    ``index.tf_decls[source_dir]`` — a name→file_id lookup scoped to
+    the terraform root (directory). Misses land external.
     """
     raw = edge.raw
     if not raw:
         return None
+
+    # Symbol-ref resolution via the directory-scoped decl map. Cheap
+    # dict lookup — no path munging.
+    if edge.kind in ("tf_var_ref", "tf_local_ref", "tf_module_ref"):
+        source_dir = source_rel.rsplit("/", 1)[0] if "/" in source_rel else ""
+        return index.tf_decls.get(source_dir, {}).get(raw)
 
     # ``${path.module}/...`` is the conventional prefix for "relative to
     # this file's module directory" in Terraform. Strip it; what remains
@@ -513,6 +548,8 @@ def _resolve_yaml(
         return _resolve_ansible(edge, index, source_rel)
     if kind.startswith("helm_"):
         return _resolve_helm(edge, index, source_rel)
+    if kind.startswith("argocd_"):
+        return _resolve_argocd(edge, index, source_rel)
     if kind.startswith("gha_"):
         return _resolve_gha(edge, index, source_rel)
     if kind.startswith("kustomize_"):
@@ -608,24 +645,32 @@ def _resolve_helm(
         # FileIndex.prepare. If one reaches resolution, skip silently.
         return None
     if kind == "helm_dependency":
-        # file:// style → raw is a path to the subchart directory,
-        # relative to the Chart.yaml's dir. Target is its Chart.yaml.
+        # Three encodings from the resolver (see helm_resolver.py):
+        #   raw=""       → no repository field; look in parent's charts/<name>/.
+        #   raw=<path>   → file:// repository; path is relative to Chart.yaml.
+        #   raw=<other>  → http(s)://, oci://, @alias — external.
         raw = edge.raw
-        if not raw or "://" in raw:
+        name = edge.symbol
+        if raw and ("://" in raw or raw.startswith("@")):
             return None  # remote — external
-        # Chart.yaml dependencies use relative paths in ``repository:``.
-        # Walk from source dir (which IS the chart dir because Chart.yaml
-        # lives there) to the subchart's Chart.yaml.
+        source_dir = source_rel.rsplit("/", 1)[0] if "/" in source_rel else ""
+        # Case 1: no repository. Helm unpacks at <parent>/charts/<name>/.
+        if not raw:
+            return _find_chart_yaml(
+                _join_dir(source_dir, f"charts/{name}"), index
+            ) if name else None
+        # Case 2: file:// path. Primary target is the path itself; fall
+        # back to charts/<name> because `helm dep update` copies the
+        # source into charts/<name> and some repos only commit the copy.
         subchart_dir = _resolve_relative(source_rel, raw)
-        if subchart_dir is None:
-            return None
-        for candidate in (
-            f"{subchart_dir}/Chart.yaml",
-            f"{subchart_dir}/Chart.yml",
-        ):
-            fid = index.find(candidate)
+        if subchart_dir is not None:
+            fid = _find_chart_yaml(subchart_dir, index)
             if fid is not None:
                 return fid
+        if name:
+            return _find_chart_yaml(
+                _join_dir(source_dir, f"charts/{name}"), index
+            )
         return None
     if kind == "helm_include":
         # Template-name → file, scoped to the source file's chart.
@@ -637,6 +682,65 @@ def _resolve_helm(
             return None
         return chart_map.get(edge.raw)
     return None
+
+
+# ---------------------------------------------------------------------------
+# ArgoCD resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_argocd(
+    edge: Edge, index: FileIndex, source_rel: str
+) -> int | None:
+    """Resolve ``argocd_app_source`` edges to a chart / kustomization /
+    raw file inside this repo.
+
+    The ``raw`` value is taken from ``spec.source.path`` / each
+    ``spec.sources[*].path`` — a repo-relative directory path. Primary
+    target is the chart or kustomization manifest at that directory;
+    fall back to a direct file match for paths that point at an
+    explicit file. Parametric paths (``charts/{{ .Values.x }}``) resolve
+    to ``None`` — they'd need Helm runtime values to disambiguate.
+    """
+    raw = edge.raw
+    if not raw:
+        return None
+    # Helm or Ansible template markers mean the path isn't literally
+    # usable. Ansible-style ``${var.x}`` isn't expected in Application
+    # specs but we still guard against it defensively.
+    if "{{" in raw or "${" in raw:
+        return None
+    # Strip leading ``./`` and trailing slash for a canonical key.
+    path = raw[2:] if raw.startswith("./") else raw
+    path = path.rstrip("/")
+    if not path:
+        return None
+    # ArgoCD App ``path:`` is always repo-root-relative, not source-
+    # file-relative. Probe chart / kustomization manifests first, then
+    # fall through to a direct file match.
+    for name in (
+        "Chart.yaml", "Chart.yml",
+        "kustomization.yaml", "kustomization.yml",
+    ):
+        fid = index.find(f"{path}/{name}")
+        if fid is not None:
+            return fid
+    return index.find(path)
+
+
+def _find_chart_yaml(dir_path: str, index: FileIndex) -> int | None:
+    """Return the file_id for ``<dir_path>/Chart.yaml`` or ``Chart.yml``."""
+    for name in ("Chart.yaml", "Chart.yml"):
+        candidate = f"{dir_path}/{name}" if dir_path else name
+        fid = index.find(candidate)
+        if fid is not None:
+            return fid
+    return None
+
+
+def _join_dir(base: str, rel: str) -> str:
+    """Join two project-relative POSIX dir paths, tolerating empty base."""
+    return f"{base}/{rel}" if base else rel
 
 
 def _find_helm_chart_root(source_rel: str, index: FileIndex) -> str | None:
@@ -971,15 +1075,39 @@ def _load_project_variables(
     shape ``FileIndex.variables`` expects. Empty when the table has no
     rows for this project — callers treat empty as "no substitution".
     """
-    rows = conn.execute(
+    rows = _db.fetch_all(
+        conn,
         "SELECT scope, name, value FROM project_variables "
         "WHERE project_id = ?",
         (project_id,),
-    ).fetchall()
+    )
     out: dict[str, dict[str, str]] = {}
     for scope, name, value in rows:
         out.setdefault(scope, {})[name] = value
     return out
+
+
+def _collect_tf_decls(
+    pending: list[tuple[int, str, str, list[Edge]]],
+) -> dict[str, dict[str, int]]:
+    """Fold ``tf_decl`` edges into a per-directory name→file_id map.
+
+    Terraform's scope is the directory (a root module or child module),
+    so we key on the source file's dirname. Multiple files in the same
+    dir can declare different vars/locals/modules; one ``variable "X"``
+    should only exist once per dir but the map is last-write-wins if
+    it doesn't (matching Terraform's own error-tolerant parse behavior).
+    """
+    result: dict[str, dict[str, int]] = {}
+    for file_id, rel_path, _lang, edges in pending:
+        dir_key = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
+        for e in edges:
+            if e.kind != "tf_decl":
+                continue
+            if not e.raw:
+                continue
+            result.setdefault(dir_key, {})[e.raw] = file_id
+    return result
 
 
 def _collect_helm_defines(
@@ -1112,7 +1240,8 @@ def get_forward(
         if not frontier:
             break
         placeholders = ",".join("?" * len(frontier))
-        rows = conn.execute(
+        rows = _db.fetch_all(
+            conn,
             f"""
             SELECT e.source_file_id, sf.rel_path,
                    e.target_file_id,  tf.rel_path,
@@ -1123,8 +1252,8 @@ def get_forward(
             WHERE e.source_file_id IN ({placeholders})
             ORDER BY sf.rel_path, e.line, e.raw
             """,
-            frontier,
-        ).fetchall()
+            tuple(frontier),
+        )
 
         next_frontier: list[int] = []
         for r in rows:
@@ -1162,7 +1291,8 @@ def get_reverse(
         if not frontier:
             break
         placeholders = ",".join("?" * len(frontier))
-        rows = conn.execute(
+        rows = _db.fetch_all(
+            conn,
             f"""
             SELECT e.source_file_id, sf.rel_path,
                    e.target_file_id,  tf.rel_path,
@@ -1173,8 +1303,8 @@ def get_reverse(
             WHERE e.target_file_id IN ({placeholders})
             ORDER BY sf.rel_path, e.line
             """,
-            frontier,
-        ).fetchall()
+            tuple(frontier),
+        )
 
         next_frontier: list[int] = []
         for r in rows:
@@ -1208,30 +1338,35 @@ def stats(conn: Connection, project_id: int | None = None) -> dict:
         proj_clause = "WHERE project_id = ?"
         params = (project_id,)
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM file_edges {proj_clause}", params
-    ).fetchone()[0]
-    resolved = conn.execute(
+    total = _db.fetch_one(
+        conn,
+        f"SELECT COUNT(*) FROM file_edges {proj_clause}",
+        params,
+    )[0]
+    resolved = _db.fetch_one(
+        conn,
         f"SELECT COUNT(*) FROM file_edges "
         f"{proj_clause} {'AND' if proj_clause else 'WHERE'} "
         f"target_file_id IS NOT NULL",
         params,
-    ).fetchone()[0]
+    )[0]
     # Parametric = NULL target AND kind != 'unresolved' AND raw carries
     # template markers. Done in SQL via ``LIKE`` rather than the
     # more precise ``has_template_markers`` regex — good enough for
     # counting and avoids pulling every row into Python.
-    parametric = conn.execute(
+    parametric = _db.fetch_one(
+        conn,
         f"SELECT COUNT(*) FROM file_edges "
         f"{proj_clause} {'AND' if proj_clause else 'WHERE'} "
         f"target_file_id IS NULL AND kind != 'unresolved' "
         f"AND (raw LIKE '%{{{{%' OR raw LIKE '%${{var.%')",
         params,
-    ).fetchone()[0]
-    by_kind_rows = conn.execute(
+    )[0]
+    by_kind_rows = _db.fetch_all(
+        conn,
         f"SELECT kind, COUNT(*) FROM file_edges {proj_clause} GROUP BY kind",
         params,
-    ).fetchall()
+    )
 
     by_kind = {k: c for k, c in by_kind_rows}
     unresolved = by_kind.get("unresolved", 0)
@@ -1254,10 +1389,11 @@ def find_file_id(
     rel_path: str,
 ) -> int | None:
     """Look up a file's id by its project-relative path. None if missing."""
-    row = conn.execute(
+    row = _db.fetch_one(
+        conn,
         "SELECT id FROM files WHERE project_id = ? AND rel_path = ?",
         (project_id, rel_path),
-    ).fetchone()
+    )
     return row[0] if row else None
 
 

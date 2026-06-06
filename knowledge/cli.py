@@ -54,6 +54,144 @@ def main(argv: list[str] | None = None) -> int:
     p_search.add_argument("--with-siblings", action="store_true")
     p_search.add_argument("--json", action="store_true")
 
+    # find — exact / prefix / regex lookup by symbol name. Schema v2+.
+    # No embedding: hits partial indexes idx_chunks_name / idx_chunks_qname
+    # directly. O(log n), under 10ms typical.
+    p_find = sub.add_parser(
+        "find",
+        help="Exact-name lookup by chunk name or qualified_name (no embedding).",
+    )
+    p_find.add_argument("name", help="Symbol name (prefix by default; see --exact/--regex)")
+    p_find.add_argument("--exact", action="store_true", help="Exact match instead of prefix")
+    p_find.add_argument("--regex", action="store_true", help="Python regex (overrides --exact)")
+    p_find.add_argument("--kind", help="Filter by chunk kind (function, resource, …)")
+    p_find.add_argument("--lang", help="Filter by language")
+    p_find.add_argument("--limit", type=int, default=10)
+    p_find.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_find.add_argument("--all-projects", action="store_true")
+    p_find.add_argument(
+        "--format",
+        choices=("citations", "chunks", "json"),
+        default="citations",
+        help="Output format (default: citations — one 'path:lines | kind | excerpt' per line)",
+    )
+
+    # grep — FTS5 MATCH over name, qualified_name, stored_text. Schema v2+.
+    # Full FTS5 query syntax: quoted phrases, prefix foo*, boolean AND/OR,
+    # column qualifier name:foo. No embedding.
+    p_grep = sub.add_parser(
+        "grep",
+        help="FTS5 full-text match over chunk names + stored text (no embedding).",
+    )
+    p_grep.add_argument("pattern", help="FTS5 query (phrases, prefix foo*, AND/OR, name:X, ...)")
+    p_grep.add_argument("--kind", help="Filter by chunk kind (function, resource, …)")
+    p_grep.add_argument("--lang", help="Filter by language")
+    p_grep.add_argument("--limit", type=int, default=10)
+    p_grep.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_grep.add_argument("--all-projects", action="store_true")
+    p_grep.add_argument(
+        "--format",
+        choices=("citations", "chunks", "json"),
+        default="citations",
+    )
+
+    # ask — hybrid lexical + semantic retrieval with reranking (Phase 3).
+    # Agent-first: citations output by default, answer cache warms
+    # automatically, token budget truncates gracefully.
+    p_ask = sub.add_parser(
+        "ask",
+        help="Hybrid search (FTS + vec, RRF merge, reranked). Best default for agents.",
+    )
+    p_ask.add_argument("question", help="Free-text query")
+    p_ask.add_argument("--top-k", type=int, default=10)
+    p_ask.add_argument("--kind", help="Filter by chunk kind")
+    p_ask.add_argument("--lang", help="Filter by language")
+    p_ask.add_argument(
+        "--budget",
+        type=int,
+        default=0,
+        help="Soft token budget — truncate citations list to roughly this many tokens (0=off)",
+    )
+    p_ask.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_ask.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass the answer cache (force fresh FTS + vec on every call)",
+    )
+    p_ask.add_argument(
+        "--format",
+        choices=("citations", "chunks", "json"),
+        default="citations",
+    )
+
+    # why — 6-line file brief (Phase 2 cartography).
+    p_why = sub.add_parser(
+        "why",
+        help="One-file brief: description, top symbols, neighbors (no embedder).",
+    )
+    p_why.add_argument("path", help="File path (repo-relative, absolute, or cwd-relative)")
+    p_why.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # map — directory tree with per-dir aggregates.
+    p_map = sub.add_parser(
+        "map",
+        help="Directory-tree overview: file counts, langs, hub files per subtree.",
+    )
+    p_map.add_argument(
+        "--dir",
+        dest="dir_filter",
+        help="Limit to files under this directory prefix (e.g. 'terraform')",
+    )
+    p_map.add_argument("--depth", type=int, default=2, help="Group by first N path components (default 2)")
+    p_map.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # brief — repo-level snapshot.
+    p_brief = sub.add_parser(
+        "brief",
+        help="Repo-wide summary: totals, top langs, hub files.",
+    )
+    p_brief.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # decide — record a non-obvious choice (Phase 4 session memory).
+    p_decide = sub.add_parser(
+        "decide",
+        help="Record a non-obvious choice with rationale + files touched.",
+    )
+    p_decide.add_argument("topic", help="Short label (e.g. 'cache invalidation')")
+    p_decide.add_argument("--decision", required=True, help="The choice itself")
+    p_decide.add_argument("--rationale", help="One-line 'why' (optional)")
+    p_decide.add_argument(
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Files touched by this decision (optional)",
+    )
+    p_decide.add_argument("--session-id", help="Tag with session identifier")
+    p_decide.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # decisions — list / search past decisions.
+    p_decs = sub.add_parser(
+        "decisions",
+        help="List or search recorded decisions.",
+    )
+    p_decs.add_argument("--topic", help="Case-insensitive substring filter on topic")
+    p_decs.add_argument("--search", dest="search_q", help="Semantic search over topic+decision")
+    p_decs.add_argument("--days", type=int, help="Only entries from the last N days")
+    p_decs.add_argument("--limit", type=int, default=20)
+    p_decs.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_decs.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+    )
+
+    # resume — opinionated session-start brief.
+    p_resume = sub.add_parser(
+        "resume",
+        help='"Where did I leave off?" — decisions + touched files + pending stage + hubs.',
+    )
+    p_resume.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
     # get
     p_get = sub.add_parser("get", help="Fetch a chunk by id")
     p_get.add_argument("chunk_id", type=int)
@@ -65,7 +203,15 @@ def main(argv: list[str] | None = None) -> int:
     p_path.add_argument("chunk_id", type=int)
 
     # projects
-    sub.add_parser("projects", help="List registered projects")
+    p_projects = sub.add_parser("projects", help="List registered projects")
+    p_projects.add_argument(
+        "--local-sqlite",
+        action="store_true",
+        help="Force the listing against local sqlite even if the current "
+             "cwd resolves to shared PostgreSQL. Useful for spotting "
+             "projects you haven't migrated yet, or for verifying a "
+             "post-migrate forget --sqlite-only worked.",
+    )
 
     # stats
     p_stats = sub.add_parser("stats", help="DB + project statistics")
@@ -74,6 +220,13 @@ def main(argv: list[str] | None = None) -> int:
     # forget
     p_forget = sub.add_parser("forget", help="Delete a project and all its chunks")
     p_forget.add_argument("project", help="Project name or absolute path")
+    p_forget.add_argument(
+        "--sqlite-only",
+        action="store_true",
+        help="Force the deletion against local sqlite even if the current "
+             "cwd resolves to shared PostgreSQL. Use after `db migrate` to "
+             "drop the now-redundant local copy without cwd gymnastics.",
+    )
 
     # history (nested subcommands)
     p_history = sub.add_parser("history", help="Work-summary storage (RAG memory)")
@@ -85,10 +238,30 @@ def main(argv: list[str] | None = None) -> int:
     p_h_add.add_argument("--tags", help="Optional comma-separated tags")
     p_h_add.add_argument("--session-id", help="Optional session identifier")
 
+    p_h_stage = p_h_sub.add_parser(
+        "stage",
+        help="Append one entry to the per-project, per-session JSONL stage "
+             "(no DB write; flush later with `knowledge history ingest`).",
+    )
+    p_h_stage.add_argument("--short", required=True, help="One-line summary (~160 chars)")
+    p_h_stage.add_argument("--long", required=True, help="Detailed summary with file refs + rationale")
+    p_h_stage.add_argument("--tags", help="Optional comma-separated tags")
+    p_h_stage.add_argument("--session-id", help="Optional session identifier (stored with the entry)")
+
     p_h_ingest = p_h_sub.add_parser("ingest", help="Flush staged JSONL entries into SQLite")
     p_h_ingest.add_argument(
         "--stage-file",
-        help="Path to the JSONL stage (default: ~/.knowledge/stage/pending.jsonl)",
+        help="Override: flush exactly this one JSONL file under the current project "
+             "(truncates on success). Without it, ingest walks every per-project "
+             "stage dir under ~/.knowledge/stage/ and absorbs the legacy "
+             "~/.knowledge/stage/pending.jsonl once if present.",
+    )
+    p_h_ingest.add_argument(
+        "--gc",
+        action="store_true",
+        help="After the ingest flow, delete any *.inflight-* debris older than "
+             "1 hour (crash leftovers from interrupted ingests). Ignored when "
+             "combined with --stage-file.",
     )
 
     p_h_recent = p_h_sub.add_parser("recent", help="Recent entries (no semantic search)")
@@ -245,6 +418,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Include kind='unresolved' edges (non-literal dynamic imports).",
     )
     p_graph.add_argument(
+        "--no-orphans",
+        action="store_true",
+        help="Drop indexed files that have no edges in or out "
+             "(CI/CD files stay visible). Default shows every file as a "
+             "dot so the graph reads as a full repo map.",
+    )
+    p_graph.add_argument(
         "--open",
         action="store_true",
         help="Launch the default web browser on the rendered file.",
@@ -269,6 +449,84 @@ def main(argv: list[str] | None = None) -> int:
         "--force",
         action="store_true",
         help="Overwrite existing SKILL.md at the target",
+    )
+
+    # config — runtime settings (storage mode, PG DSN status). Phase 0 of
+    # the shared-PostgreSQL plan; works against sqlite-only installs too
+    # (just reports "mode: sqlite").
+    p_config = sub.add_parser(
+        "config",
+        help="Inspect / initialize .knowledge.yaml (storage mode, PG env)",
+    )
+    p_config_sub = p_config.add_subparsers(dest="config_cmd", required=True)
+
+    p_cfg_init = p_config_sub.add_parser(
+        "init",
+        help="Write a .knowledge.yaml: $HOME by default, --project for the git root",
+    )
+    p_cfg_init.add_argument(
+        "--project",
+        action="store_true",
+        help="Write to <git-root>/.knowledge.yaml instead of $HOME/.knowledge.yaml. "
+             "Same schema either way; the closer file wins at runtime.",
+    )
+    p_cfg_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing .knowledge.yaml at the chosen target",
+    )
+
+    p_cfg_show = p_config_sub.add_parser(
+        "show",
+        help="Print effective storage mode, masked DSN, env-var status, source",
+    )
+    p_cfg_show.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_config_sub.add_parser(
+        "check-env",
+        help="Verify KNOWLEDGE_PG_* env vars are set when mode=shared_postgresql",
+    )
+
+    # db — backend administration (init-postgres). Phase 1a of the shared-PG
+    # plan; only meaningful when storage.mode = shared_postgresql.
+    p_db = sub.add_parser(
+        "db",
+        help="Backend administration (ping, init-postgres, …)",
+    )
+    p_db_sub = p_db.add_subparsers(dest="db_cmd", required=True)
+    p_db_sub.add_parser(
+        "ping",
+        help="Open a connection to the configured backend, report version + "
+             "extension status, then close. No state changes. Use this to "
+             "verify your config / env / network before knowledge build.",
+    )
+    p_db_sub.add_parser(
+        "init-postgres",
+        help="Apply knowledge/schema/postgres/*.sql to the configured PG database "
+             "(idempotent — re-applies are no-ops)",
+    )
+    p_db_migrate = p_db_sub.add_parser(
+        "migrate",
+        help="Copy ONE project from local SQLite to the configured shared PG. "
+             "Embeddings, edges, history, decisions, project variables. "
+             "Idempotent only at the conflict-check level — re-running on a "
+             "project already present on PG fails fast.",
+    )
+    p_db_migrate.add_argument(
+        "--project",
+        required=True,
+        help="Project name or absolute path (resolved against local sqlite)",
+    )
+    p_db_migrate.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation prompt (use in scripts/CI)",
+    )
+    p_db_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run pre-flight checks (resolve, model match, conflict, counts) "
+             "and print the plan; do not write to PG",
     )
 
     # install-hooks
@@ -307,10 +565,11 @@ def cmd_build(args: argparse.Namespace) -> int:
         # Rebuild in place? If a row already exists at this exact root, it's
         # not a collision — just a re-build of the same project. Skip the
         # collision check so the user isn't prompted on every rebuild.
-        existing_here = conn.execute(
+        existing_here = db.fetch_one(
+            conn,
             "SELECT 1 FROM projects WHERE root_path = ? LIMIT 1",
             (str(root.resolve()),),
-        ).fetchone()
+        )
 
         resolved_name = proposed_name
         ids_to_forget: list[int] = []
@@ -350,9 +609,13 @@ def cmd_build(args: argparse.Namespace) -> int:
             print(f"registering as: {resolved_name}", flush=True)
 
         t0 = time.time()
-        project_id, files, chunks = indexer.build_project(
-            conn, root, name_override=resolved_name
-        )
+        try:
+            project_id, files, chunks = indexer.build_project(
+                conn, root, name_override=resolved_name
+            )
+        except db.ProjectBusyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 3
     elapsed = time.time() - t0
     print(f"done: {files} files, {chunks} chunks in {elapsed:.1f}s (project_id={project_id})")
     return 0
@@ -365,9 +628,13 @@ def cmd_update(args: argparse.Namespace) -> int:
     print(f"updating index for: {root}", flush=True)
     t0 = time.time()
     with db.connect() as conn:
-        project_id, files_visited, chunks_embedded = indexer.update_project(
-            conn, root, name_override=None
-        )
+        try:
+            project_id, files_visited, chunks_embedded = indexer.update_project(
+                conn, root, name_override=None
+            )
+        except db.ProjectBusyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 3
     elapsed = time.time() - t0
     print(
         f"done: {files_visited} files visited, {chunks_embedded} chunks "
@@ -435,10 +702,11 @@ def _project_is_stale(conn, proj) -> bool:
     or is missing from disk. Early-exits on first stale finding."""
     from . import config as _config
 
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         "SELECT rel_path, mtime FROM files WHERE project_id = ?",
         (proj.id,),
-    ).fetchall()
+    )
 
     root = proj.root_path
     grace = _config.STALE_GRACE_SECONDS
@@ -488,6 +756,470 @@ def cmd_search(args: argparse.Namespace) -> int:
     else:
         _print_results_pretty(results)
     return 0
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    """Exact/prefix/regex symbol lookup — schema v2+."""
+    from . import fts
+
+    with db.connect() as conn:
+        project_id = _resolve_scope(conn, args)
+        if project_id is _SCOPE_ERROR:
+            return 1
+        try:
+            results = fts.find(
+                conn,
+                name=args.name,
+                project_id=project_id,
+                exact=args.exact,
+                regex=args.regex,
+                kind=args.kind,
+                lang=args.lang,
+                limit=args.limit,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    _emit_results(results, args.format)
+    return 0
+
+
+def cmd_grep(args: argparse.Namespace) -> int:
+    """FTS5 MATCH lookup — schema v2+."""
+    import apsw  # FTS5 syntax errors surface as apsw.SQLError.
+    from . import fts
+
+    with db.connect() as conn:
+        project_id = _resolve_scope(conn, args)
+        if project_id is _SCOPE_ERROR:
+            return 1
+        try:
+            results = fts.grep(
+                conn,
+                pattern=args.pattern,
+                project_id=project_id,
+                kind=args.kind,
+                lang=args.lang,
+                limit=args.limit,
+            )
+        except apsw.SQLError as exc:
+            print(
+                f"error: invalid FTS5 query: {exc}\n"
+                "examples: 'vault auth', '\"exact phrase\"', 'foo*', "
+                "'vault AND approle', 'name:handle_*'.",
+                file=sys.stderr,
+            )
+            return 1
+
+    _emit_results(results, args.format)
+    return 0
+
+
+# Sentinel for _resolve_scope — distinguishes "error emitted, bail out"
+# from the legitimate ``None`` value meaning "--all-projects".
+_SCOPE_ERROR: object = object()
+
+
+def _resolve_scope(conn, args) -> int | None | object:
+    """Return project_id (int), None (all-projects), or _SCOPE_ERROR.
+
+    Shared by find/grep. Emits the error message to stderr on failure so
+    the caller just has to check for the sentinel and return 1.
+    """
+    if getattr(args, "all_projects", False):
+        return None
+    try:
+        proj = projects.resolve_project(conn, args.project)
+    except projects.AmbiguousProjectName as exc:
+        _print_ambiguous(exc)
+        return _SCOPE_ERROR
+    if proj is None:
+        where = args.project or str(projects.current_project_root())
+        print(
+            f"error: project not registered: {where}\n"
+            "run 'knowledge build' from the repo root first.",
+            file=sys.stderr,
+        )
+        return _SCOPE_ERROR
+    return proj.id
+
+
+def _emit_results(results, fmt: str) -> None:
+    """Dispatch SearchResult list to the chosen formatter."""
+    if fmt == "json":
+        print(json.dumps([r._asdict() for r in results], indent=2, default=str))
+    elif fmt == "chunks":
+        _print_results_pretty(results)
+    else:  # citations
+        _print_results_citations(results)
+
+
+def _print_results_citations(results) -> None:
+    """One result per line, parseable with ``split(' | ', 2)``.
+
+    Format: ``rel/path:start-end | kind | one-line excerpt``.
+
+    The excerpt is the first non-empty line of the stored text after
+    whitespace decompression, trimmed at 160 chars so an LLM can diff
+    results at a glance without scrolling.
+    """
+    if not results:
+        return
+    from .whitespace import decompress
+
+    for r in results:
+        excerpt = _first_line(decompress(r.preview))
+        print(f"{r.rel_path}:{r.start_line}-{r.end_line} | {r.kind} | {excerpt}")
+
+
+def _first_line(text: str, max_chars: int = 160) -> str:
+    """Collapse to the first meaningful line for a citation excerpt."""
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s:
+            return s[:max_chars]
+    return ""
+
+
+def cmd_decide(args: argparse.Namespace) -> int:
+    """Record a decision — Phase 4 session memory."""
+    from . import decisions as decisions_mod
+
+    topic = args.topic.strip()
+    decision = args.decision.strip()
+    if not topic or not decision:
+        print("error: topic and --decision must be non-empty", file=sys.stderr)
+        return 2
+
+    with db.connect() as conn:
+        # `decide` should work even before a `build`; auto-create the project
+        # row the same way `history add` does.
+        root = projects.current_project_root()
+        proj = projects.get_or_create_project(conn, root)
+        new_id = decisions_mod.add(
+            conn,
+            project_id=proj.id,
+            topic=topic,
+            decision=decision,
+            rationale=args.rationale,
+            files_touched=args.files,
+            session_id=args.session_id,
+        )
+    print(f"recorded decision id={new_id} in '{proj.name}' ({proj.root_path})")
+    return 0
+
+
+def cmd_decisions(args: argparse.Namespace) -> int:
+    """List / search decisions — Phase 4."""
+    from . import decisions as decisions_mod
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        if args.search_q:
+            raw = decisions_mod.search(
+                conn,
+                query=args.search_q,
+                project_id=proj.id,
+                top_k=args.limit,
+            )
+            entries = [(d, dist) for d, dist in raw]
+        else:
+            plain = decisions_mod.recent(
+                conn,
+                project_id=proj.id,
+                days=args.days,
+                topic=args.topic,
+                limit=args.limit,
+            )
+            # Pair with None distance so the formatter handles both paths uniformly.
+            entries = [(d, None) for d in plain]
+
+    if args.format == "json":
+        print(json.dumps(
+            [
+                {"decision": d._asdict(), "distance": dist}
+                for d, dist in entries
+            ],
+            indent=2,
+            default=str,
+        ))
+    else:
+        _print_decisions(entries)
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Session-start brief — Phase 4 session memory."""
+    from . import resume as resume_mod
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        brief = resume_mod.build(
+            conn,
+            project_id=proj.id,
+            project_name=proj.name,
+            project_root=proj.root_path,
+        )
+    _print_resume(brief)
+    return 0
+
+
+def _print_decisions(entries) -> None:
+    """Pretty-print (Decision, distance|None) tuples."""
+    from datetime import datetime
+
+    if not entries:
+        print("(no decisions)")
+        return
+    for d, dist in entries:
+        when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d %H:%M")
+        dist_s = f"  dist={dist:.3f}" if dist is not None else ""
+        print(f"{when}  id={d.id}{dist_s}")
+        print(f"  topic:    {d.topic}")
+        print(f"  decision: {d.decision}")
+        if d.rationale:
+            print(f"  why:      {d.rationale}")
+        if d.files_touched:
+            print(f"  files:    {', '.join(d.files_touched)}")
+
+
+def _print_resume(rb) -> None:
+    """Four-block session-start brief. Plain text, token-budget-aware."""
+    from datetime import datetime
+
+    print(f"{rb.project_name}  ({rb.project_root})")
+    print(
+        f"history: {rb.total_history_entries} entries  "
+        f"decisions: {rb.total_decisions}"
+    )
+
+    # 1. Decisions
+    print("\n# recent decisions")
+    if not rb.last_decisions:
+        print("  (none yet — log with `knowledge decide`)")
+    else:
+        for d in rb.last_decisions:
+            when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d")
+            print(f"  {when}  {d.topic}")
+            print(f"            → {d.decision}")
+
+    # 2. Touched files
+    print("\n# most-touched files (last 7d)")
+    if not rb.touched_files:
+        print("  (no history tokens or recent commits matched indexed files)")
+    else:
+        for rel, score in rb.touched_files:
+            print(f"  [{score:>2}] {rel}")
+
+    # 3. Pending stage
+    if rb.pending_stage:
+        print("\n# pending in stage (not yet ingested)")
+        for entry in rb.pending_stage:
+            short = str(entry.get("short", "?")).strip()
+            print(f"  - {short[:100]}")
+
+    # 4. Hub files
+    if rb.hub_files:
+        print("\n# hub files (orientation)")
+        for rel, deg in rb.hub_files:
+            print(f"  {deg:>3}×  {rel}")
+
+    # Footer guidance for the agent reading this output.
+    print(
+        "\n# how to proceed\n"
+        "  - use `knowledge ask '<question>'` for search\n"
+        "  - use `knowledge why <path>` to understand one file\n"
+        "  - log non-obvious choices with `knowledge decide <topic> --decision <...>`"
+    )
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Hybrid search + rerank + cache — Phase 3 entry point for agents."""
+    from . import hybrid_search
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        results = hybrid_search.ask(
+            conn,
+            query=args.question,
+            project_id=proj.id,
+            project_root=proj.root_path,
+            kind=args.kind,
+            lang=args.lang,
+            top_k=args.top_k,
+            use_cache=not args.no_cache,
+        )
+
+    kept, omitted = hybrid_search.truncate_to_budget(results, args.budget)
+    _emit_results(kept, args.format)
+    if omitted > 0 and args.format == "citations":
+        print(f"...{omitted} more omitted (raise --budget to see)")
+    return 0
+
+
+def cmd_why(args: argparse.Namespace) -> int:
+    """One-file brief — Phase 2 cartography."""
+    from . import cartography
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        rel_path = _resolve_relations_target(args.path, proj.root_path)
+        brief = cartography.why(conn, rel_path, proj.id, proj.root_path)
+
+    if brief is None:
+        print(
+            f"error: file not indexed: {rel_path}\n"
+            "check the path, or run 'knowledge update' if the file is new.",
+            file=sys.stderr,
+        )
+        return 1
+    _print_why(brief)
+    return 0
+
+
+def cmd_map(args: argparse.Namespace) -> int:
+    """Directory-tree overview — Phase 2 cartography."""
+    from . import cartography
+
+    if args.depth < 1:
+        print("error: --depth must be >= 1", file=sys.stderr)
+        return 1
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        entries, truncated = cartography.map_tree(
+            conn,
+            project_id=proj.id,
+            dir_filter=args.dir_filter,
+            depth=args.depth,
+        )
+
+    if not entries:
+        scope = f" under '{args.dir_filter}'" if args.dir_filter else ""
+        print(f"(no files indexed{scope} for {proj.name})")
+        return 0
+    _print_map(entries, proj, truncated, args.dir_filter, args.depth)
+    return 0
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    """Repo-wide snapshot — Phase 2 cartography."""
+    from . import cartography
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        rb = cartography.brief(
+            conn,
+            project_id=proj.id,
+            project_name=proj.name,
+            project_root=str(proj.root_path),
+            last_updated=proj.last_update,
+        )
+    _print_brief(rb)
+    return 0
+
+
+def _print_why(b) -> None:
+    """Render a :class:`FileBrief` as a compact text block."""
+    print(f"{b.rel_path}")
+    meta = f"  lang={b.lang}  loc={b.loc}  size={_format_bytes(b.size)}"
+    if b.last_commit_date:
+        meta += f"  last_commit={b.last_commit_date}"
+    print(meta)
+
+    if b.description:
+        print(f"  desc: {b.description}")
+
+    if b.top_symbols:
+        print("  top symbols:")
+        for kind, name, sl, el, _cc in b.top_symbols:
+            print(f"    [{kind}] {name}  ({sl}-{el})")
+
+    if b.inbound:
+        print("  inbound:")
+        for src, kind in b.inbound:
+            print(f"    ← {src}  ({kind})")
+    if b.outbound:
+        print("  outbound:")
+        for tgt, kind in b.outbound:
+            print(f"    → {tgt}  ({kind})")
+    if not b.inbound and not b.outbound:
+        print("  (no resolved cross-file edges)")
+
+
+def _print_map(entries, proj, truncated: bool, dir_filter, depth: int) -> None:
+    """Render a directory map as a fixed-width table."""
+    header_dir = "DIR"
+    header = f"{header_dir:<38} {'FILES':>6} {'LANG':<12}  TOP KINDS / ENTRYPOINT"
+    print(f"{proj.name} ({proj.root_path})")
+    if dir_filter:
+        print(f"filter: {dir_filter}  depth: {depth}")
+    else:
+        print(f"depth: {depth}")
+    print(header)
+    print("-" * len(header))
+    for e in entries:
+        kinds = ", ".join(f"{k}×{n}" for k, n in e.top_kinds) or "-"
+        entrypoint = f"  →{e.entrypoint}" if e.entrypoint else ""
+        dir_display = e.dir_path or "(repo root)"
+        # Truncate excessively long dir paths so the table stays aligned.
+        if len(dir_display) > 37:
+            dir_display = "…" + dir_display[-36:]
+        print(
+            f"{dir_display:<38} {e.file_count:>6} "
+            f"{(e.dominant_lang or '-'):<12}  {kinds}{entrypoint}"
+        )
+    if truncated:
+        print(
+            "\nwarning: output truncated at 200 directory rows. "
+            "Narrow with --dir <path> or reduce --depth.",
+            file=sys.stderr,
+        )
+
+
+def _print_brief(rb) -> None:
+    """Render a :class:`RepoBrief`."""
+    from datetime import datetime
+
+    print(f"{rb.project_name}  ({rb.project_root})")
+    if rb.last_updated:
+        print(f"last_update: {datetime.fromtimestamp(rb.last_updated).strftime('%Y-%m-%d %H:%M')}")
+    print(f"files={rb.file_count}  chunks={rb.chunk_count}  edges={rb.edge_count}")
+
+    if rb.top_langs:
+        print("\ntop langs:")
+        for lang, n in rb.top_langs:
+            print(f"  {lang:<14} {n}")
+
+    if rb.hub_files:
+        print("\nhub files (by in-degree):")
+        for rel, deg in rb.hub_files:
+            print(f"  {deg:>3}×  {rel}")
+    else:
+        print("\n(no resolved cross-file edges)")
+
+
+def _format_bytes(size: int) -> str:
+    """Compact byte-size like '4.2KB' / '1.1MB'. Zero returns '0B'."""
+    s: float = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if s < 1024:
+            return f"{s:.1f}{unit}" if unit != "B" else f"{int(s)}B"
+        s /= 1024
+    return f"{s:.1f}TB"
 
 
 def cmd_get(args: argparse.Namespace) -> int:
@@ -589,6 +1321,9 @@ def cmd_path(args: argparse.Namespace) -> int:
 
 
 def cmd_projects(args: argparse.Namespace) -> int:
+    if getattr(args, "local_sqlite", False):
+        return _cmd_projects_sqlite_only()
+
     with db.connect() as conn:
         rows = projects.list_projects(conn)
     if not rows:
@@ -603,13 +1338,56 @@ def cmd_projects(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_projects_sqlite_only() -> int:
+    """List projects from local sqlite regardless of cwd resolution.
+
+    Same dispatch-bypass pattern as ``forget --sqlite-only`` — opens
+    raw APSW via :func:`db.connect_sqlite` so the listing reflects the
+    laptop's local index even when the current cwd routes everything
+    else to shared PostgreSQL.
+    """
+
+    conn = db.connect_sqlite()
+    try:
+        rows = conn.execute(
+            "SELECT name, root_path, file_count, chunk_count "
+            "FROM projects ORDER BY name"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        print("No projects in local sqlite.")
+        return 0
+    header = f"{'NAME':<24} {'FILES':>6} {'CHUNKS':>7}  ROOT"
+    print(header)
+    print("-" * len(header))
+    for name, root, fc, cc in rows:
+        print(f"{name:<24} {fc:>6} {cc:>7}  {root}")
+    print()
+    print(f"({len(rows)} project(s) — sqlite source: {paths.db_path()})")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     with db.connect() as conn:
         rows = projects.list_projects(conn)
-        total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        total_files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    print(f"DB:          {paths.db_path()}")
-    print(f"DB size:     {_format_size(paths.db_path())}")
+        total_chunks = db.fetch_one(conn, "SELECT COUNT(*) FROM chunks")[0]
+        total_files = db.fetch_one(conn, "SELECT COUNT(*) FROM files")[0]
+    if db.current_mode() == "postgresql":
+        from . import settings as settings_mod
+
+        s = settings_mod.load_settings()
+        pg = s.postgresql
+        backend_descr = (
+            f"postgresql ({pg.host}:{pg.port}/{pg.database})"
+            if pg is not None else "postgresql"
+        )
+        print(f"DB:          {backend_descr}")
+        print(f"config:      {s.config_source}")
+    else:
+        print(f"DB:          {paths.db_path()}")
+        print(f"DB size:     {_format_size(paths.db_path())}")
     print(f"Projects:    {len(rows)}")
     print(f"Files:       {total_files}")
     print(f"Chunks:      {total_chunks}")
@@ -626,6 +1404,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_forget(args: argparse.Namespace) -> int:
+    if getattr(args, "sqlite_only", False):
+        return _cmd_forget_sqlite_only(args)
+
     with db.connect() as conn:
         try:
             proj = projects.resolve_project(conn, args.project)
@@ -646,6 +1427,98 @@ def cmd_forget(args: argparse.Namespace) -> int:
             return 1
         projects.forget_project(conn, proj.id)
     print(f"forgot: {proj.name} ({proj.root_path})")
+    return 0
+
+
+def _cmd_forget_sqlite_only(args: argparse.Namespace) -> int:
+    """Force-delete a project from local sqlite regardless of current cwd's mode.
+
+    Uses raw APSW (``db.connect_sqlite()`` + ``conn.execute()``) so we
+    don't go through the ``db.fetch_one`` / ``db.execute`` helpers that
+    dispatch on ``current_mode()``. When current_mode is "postgresql"
+    those helpers would translate ``?`` placeholders to ``%s`` and break
+    on APSW.
+    """
+
+    selector = args.project
+    p = Path(selector).expanduser()
+    conn = db.connect_sqlite()
+    try:
+        if p.is_absolute():
+            row = conn.execute(
+                "SELECT id, name, root_path FROM projects WHERE root_path = ?",
+                (str(p.resolve()),),
+            ).fetchone()
+            matches = [row] if row else []
+        else:
+            matches = conn.execute(
+                "SELECT id, name, root_path FROM projects WHERE name = ?",
+                (selector,),
+            ).fetchall()
+
+        if not matches:
+            print(
+                f"error: project not found in local sqlite: {selector}",
+                file=sys.stderr,
+            )
+            return 1
+
+        if len(matches) > 1:
+            if not sys.stdin.isatty():
+                print(
+                    f"error: '{selector}' matches {len(matches)} local sqlite "
+                    f"rows. Re-run with the absolute path:",
+                    file=sys.stderr,
+                )
+                for _id, _name, root in matches:
+                    print(f"  {root}", file=sys.stderr)
+                return 1
+            print(
+                f"'{selector}' matches {len(matches)} local sqlite rows.",
+                "Pick which to forget (comma-separated indexes, or 'all'):",
+            )
+            for i, (_id, name, root) in enumerate(matches, start=1):
+                print(f"  [{i}] {name}  {root}")
+            try:
+                answer = input("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\naborted.", file=sys.stderr)
+                return 1
+            if answer == "all":
+                chosen = matches
+            else:
+                idxs = [int(t) for t in answer.split(",") if t.strip().isdigit()]
+                chosen = [matches[i - 1] for i in idxs if 1 <= i <= len(matches)]
+            if not chosen:
+                print("aborted.", file=sys.stderr)
+                return 1
+        else:
+            chosen = matches
+
+        # vec0 has no FK cascade; wipe per-table before dropping the
+        # project row. ``meta`` / `query_cache` cascade naturally via the
+        # projects.id FK.
+        for proj_id, name, root in chosen:
+            conn.execute(
+                "DELETE FROM chunks_vec WHERE chunk_id IN "
+                "(SELECT id FROM chunks WHERE project_id = ?)",
+                (proj_id,),
+            )
+            conn.execute(
+                "DELETE FROM history_vec WHERE history_id IN "
+                "(SELECT id FROM history WHERE project_id = ?)",
+                (proj_id,),
+            )
+            conn.execute(
+                "DELETE FROM decisions_vec WHERE decision_id IN "
+                "(SELECT id FROM decisions WHERE project_id = ?)",
+                (proj_id,),
+            )
+            conn.execute("DELETE FROM projects WHERE id = ?", (proj_id,))
+            print(f"forgot from sqlite: {name} ({root})")
+    finally:
+        # APSW connections close on garbage collection but be explicit.
+        conn.close()
     return 0
 
 
@@ -695,6 +1568,23 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
         print("  the `/knowledge` skill is now available in this project.")
         print("  commit .claude/skills/knowledge/SKILL.md if you want teammates to share it.")
     print("  from a repo root, run `knowledge build` once to index the code.")
+
+    # Hint when this scope resolves to shared_postgresql — agents picking up
+    # the skill need the env vars set, otherwise every command fails at the
+    # first DSN resolution.
+    from . import settings as settings_mod
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError:
+        return 0
+    if s.mode == "shared_postgresql":
+        print()
+        print(
+            "shared_postgresql is active for this scope "
+            f"({s.config_source}) — verify the laptop has env vars exported:"
+        )
+        print("  knowledge config check-env")
     return 0
 
 
@@ -784,8 +1674,8 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
     print()
     print("to verify:")
     print(
-        "  1. append a JSON entry to ~/.knowledge/stage/pending.jsonl in a "
-        "running session"
+        "  1. `knowledge history stage --short '...' --long '...'` "
+        "(appends to ~/.knowledge/stage/<project>/sess-<id>.jsonl)"
     )
     print("  2. run /compact (or let auto-compact fire)")
     print("  3. `knowledge history recent --limit 1` — the entry should be there")
@@ -876,30 +1766,148 @@ def cmd_history_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_history_stage(args: argparse.Namespace) -> int:
+    """Append one JSONL entry to the per-project, per-session stage file.
+
+    No DB write for the entry itself — a later ``knowledge history ingest``
+    flushes it under an APSW savepoint. We *do* register the project
+    (``get_or_create_project``) so ingest can resolve the dir back to a
+    project without re-hashing every known root. The project row is cheap
+    and the user is about to write durable work-history into it anyway, so
+    the "no empty rows for random cwds" concern from the ingest fast path
+    doesn't apply here.
+    """
+    import fcntl  # POSIX-only; repo-knowledge doesn't support Windows.
+
+    short = args.short.strip()
+    long_ = args.long.strip()
+    if not short or not long_:
+        print("error: --short and --long must be non-empty", file=sys.stderr)
+        return 2
+
+    root = projects.current_project_root()
+    with db.connect() as conn:
+        proj = projects.get_or_create_project(conn, root)
+
+    project_dir = paths.project_stage_dir(root)
+    sidecar = paths.root_sidecar_path(project_dir)
+    if not sidecar.exists():
+        sidecar.write_text(f"{proj.root_path}\n", encoding="utf-8")
+
+    stage = paths.session_stage_file(root)
+    entry: dict = {"short": short, "long": long_}
+    if args.tags:
+        entry["tags"] = args.tags
+    if args.session_id:
+        entry["session_id"] = args.session_id
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+
+    # flock serializes appends if two Bash invocations from the same
+    # session race. O_APPEND alone is only atomic up to PIPE_BUF (~4 KB);
+    # long_summary can exceed that. flock is a cheap guarantee.
+    with open(stage, "a", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fh.write(line)
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    print(f"staged in '{proj.name}' ({stage})")
+    return 0
+
+
 def cmd_history_ingest(args: argparse.Namespace) -> int:
     from . import history
 
-    stage = (
-        Path(args.stage_file).expanduser() if args.stage_file else paths.stage_path()
-    )
-    # Empty-stage fast path — no DB touch. Critical for user-scoped hooks
-    # that fire on every session: if we called get_or_create_project here,
-    # every random repo the user opens would accrete an empty project row.
-    if not stage.exists() or not stage.read_text(encoding="utf-8").strip():
-        print(f"stage is empty: {stage}")
+    # Explicit single-file override: current-project, truncate-on-success.
+    # Used by tests, manual replay, and internally for legacy migration.
+    if args.stage_file:
+        if args.gc:
+            print(
+                "note: --gc ignored with --stage-file (GC sweeps the stage "
+                "dir, not an arbitrary path)",
+                file=sys.stderr,
+            )
+        stage = Path(args.stage_file).expanduser()
+        if not stage.exists() or not stage.read_text(encoding="utf-8").strip():
+            print(f"stage is empty: {stage}")
+            return 0
+        with db.connect() as conn:
+            root = projects.current_project_root()
+            proj = projects.get_or_create_project(conn, root)
+            ingested, skipped = history.ingest_stage(conn, stage, proj.id)
+        if ingested > 0:
+            print(f"ingested: {ingested} into '{proj.name}' ({proj.root_path})")
+            print(f"stage file truncated: {stage}")
+        if skipped > 0:
+            print(f"skipped (malformed): {skipped}", file=sys.stderr)
         return 0
-    with db.connect() as conn:
-        root = projects.current_project_root()
-        proj = projects.get_or_create_project(conn, root)
-        ingested, skipped = history.ingest_stage(conn, stage, proj.id)
 
-    if ingested > 0:
-        print(
-            f"ingested: {ingested} into '{proj.name}' ({proj.root_path})"
-        )
-        print(f"stage file truncated: {stage}")
-    if skipped > 0:
-        print(f"skipped (malformed): {skipped}", file=sys.stderr)
+    # Default flow: walk every per-project stage dir + absorb legacy file.
+    legacy = paths.legacy_stage_path()
+    project_dirs = paths.iter_stage_project_dirs()
+    has_legacy = legacy.exists() and legacy.read_text(encoding="utf-8").strip() != ""
+    has_sess = any(any(d.glob("sess-*.jsonl")) for d in project_dirs)
+
+    # Empty-stage fast path — no DB connect. The hook fires on every Stop /
+    # PreCompact / SessionEnd for every repo the user touches; skipping DB
+    # work here keeps the cost near zero when there's nothing to flush.
+    if not has_legacy and not has_sess:
+        print("stage is empty")
+        if args.gc:
+            removed = history.sweep_inflight_debris(paths.stage_dir(), 3600)
+            if removed > 0:
+                print(f"gc: removed {removed} inflight debris file(s)")
+        return 0
+
+    total_ingested = 0
+    total_skipped = 0
+    per_project: list[tuple[str, Path, int]] = []  # (name, root, ingested)
+
+    with db.connect() as conn:
+        # Legacy file: absorb under current cwd's project (same heuristic
+        # the tool has always used), then delete so we don't migrate twice.
+        if has_legacy:
+            root = projects.current_project_root()
+            proj = projects.get_or_create_project(conn, root)
+            i, s = history.ingest_stage(conn, legacy, proj.id)
+            legacy.unlink(missing_ok=True)
+            total_ingested += i
+            total_skipped += s
+            if i > 0:
+                per_project.append((proj.name, proj.root_path, i))
+
+        # Per-project dirs: resolve each via its .root sidecar.
+        for pd in project_dirs:
+            sidecar = paths.root_sidecar_path(pd)
+            if not sidecar.exists():
+                # Orphan dir (no sidecar → can't resolve). Skip silently;
+                # a future `stage` call in the matching repo re-creates it.
+                continue
+            root_str = sidecar.read_text(encoding="utf-8").strip()
+            if not root_str:
+                continue
+            proj = projects.get_or_create_project(conn, Path(root_str))
+            i, s = history.ingest_stage_dir(conn, pd, proj.id)
+            total_ingested += i
+            total_skipped += s
+            if i > 0:
+                per_project.append((proj.name, proj.root_path, i))
+
+    for name, rpath, count in per_project:
+        print(f"ingested: {count} into '{name}' ({rpath})")
+    if total_ingested == 0 and total_skipped == 0:
+        print("stage is empty")
+    if total_skipped > 0:
+        print(f"skipped (malformed): {total_skipped}", file=sys.stderr)
+
+    if args.gc:
+        # 1 hour: ingest completes in seconds in practice, so anything
+        # still inflight after an hour is almost certainly crash debris.
+        removed = history.sweep_inflight_debris(paths.stage_dir(), 3600)
+        if removed > 0:
+            print(f"gc: removed {removed} inflight debris file(s)")
+
     return 0
 
 
@@ -994,6 +2002,7 @@ def cmd_history_get(args: argparse.Namespace) -> int:
 
 _HISTORY_DISPATCH = {
     "add": cmd_history_add,
+    "stage": cmd_history_stage,
     "ingest": cmd_history_ingest,
     "recent": cmd_history_recent,
     "search": cmd_history_search,
@@ -1134,12 +2143,13 @@ def _sibling_files(conn, project_id: int, rel_path: str) -> list[dict]:
     """
     dir_prefix = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
     pattern = f"{dir_prefix}/%" if dir_prefix else "%"
-    rows = conn.execute(
+    rows = db.fetch_all(
+        conn,
         "SELECT rel_path, lang FROM files "
         "WHERE project_id = ? AND rel_path LIKE ? AND rel_path != ? "
         "ORDER BY rel_path LIMIT 50",
         (project_id, pattern, rel_path),
-    ).fetchall()
+    )
     # Exclude rows that are in SUBdirectories — pattern ``dir/%`` also
     # matches ``dir/sub/file``. Drop anything with a deeper slash count.
     target_depth = rel_path.count("/")
@@ -1416,6 +2426,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
             include_external=args.include_external,
             include_parametric=args.include_parametric,
             include_unresolved=args.include_unresolved,
+            include_orphans=not args.no_orphans,
         )
 
     out_path = (
@@ -1704,6 +2715,15 @@ _DISPATCH = {
     "update": cmd_update,
     "status": cmd_status,
     "search": cmd_search,
+    "find": cmd_find,
+    "grep": cmd_grep,
+    "ask": cmd_ask,
+    "why": cmd_why,
+    "map": cmd_map,
+    "brief": cmd_brief,
+    "decide": cmd_decide,
+    "decisions": cmd_decisions,
+    "resume": cmd_resume,
     "get": cmd_get,
     "path": cmd_path,
     "projects": cmd_projects,
@@ -1715,6 +2735,455 @@ _DISPATCH = {
     "graph": cmd_graph,
     "install-skill": cmd_install_skill,
     "install-hooks": cmd_install_hooks,
+    "config": lambda args: _CONFIG_DISPATCH[args.config_cmd](args),
+    "db": lambda args: _DB_DISPATCH[args.db_cmd](args),
+}
+
+
+# ---------------------------------------------------------------------------
+# config subcommands (Phase 0)
+# ---------------------------------------------------------------------------
+
+
+def cmd_config_init(args: argparse.Namespace) -> int:
+    """Write a ``.knowledge.yaml`` at the chosen scope.
+
+    Default target: ``$HOME/.knowledge.yaml`` (laptop default).
+    With ``--project``: ``<git-root>/.knowledge.yaml`` (per-repo override).
+
+    Same file name and schema at every scope; resolution at runtime walks
+    up from cwd and uses the closest match (with $HOME as last-resort
+    fallback). So ``--project`` is just "put it closer", nothing more.
+
+    Refuses to overwrite an existing file unless ``--force`` is passed.
+    """
+
+    if getattr(args, "project", False):
+        dst = projects.current_project_root() / ".knowledge.yaml"
+        scope = "project"
+    else:
+        dst = paths.config_path()
+        scope = "laptop default"
+
+    if dst.exists() and not args.force:
+        print(f"{dst} already exists. Use --force to overwrite.", file=sys.stderr)
+        return 1
+
+    src = Path(__file__).parent / "config.example.yaml"
+    dst.write_text(src.read_text("utf-8"), encoding="utf-8")
+    print(f"wrote {dst}  ({scope})")
+    print("next: edit storage.mode if you want shared_postgresql, then")
+    print("      copy knowledge/config.example.env to your shell profile and")
+    print("      export KNOWLEDGE_PG_USER / KNOWLEDGE_PG_PASSWORD.")
+    print("      knowledge config show  # confirms which file is in effect")
+    return 0
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    """Print mode + masked DSN + env-var status + source.
+
+    Never prints secrets — passwords are masked, env-var values are reported
+    as ``set`` / ``unset`` only.
+    """
+
+    from . import settings as settings_mod
+
+    report = settings_mod.build_report()
+    s = report.settings
+    if args.json:
+        out = {
+            "mode": s.mode,
+            "config_source": s.config_source,
+            "dsn_source": report.dsn_source,
+            "dsn_masked": report.dsn_masked,
+            "env_status": report.env_status,
+            "error": report.error,
+        }
+        print(json.dumps(out, indent=2))
+        return 0 if not report.error else 1
+
+    print(f"mode:           {s.mode}")
+    print(f"config_source:  {s.config_source}{_describe_source(s.config_source)}")
+    print(f"dsn_source:     {report.dsn_source}")
+    if s.mode == "shared_postgresql":
+        if report.dsn_masked:
+            print(f"dsn:            {report.dsn_masked}")
+        for name, present in report.env_status.items():
+            print(f"{name:14s}  {'set' if present else 'unset'}")
+    if report.error:
+        print(f"error:          {report.error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _describe_source(source: str) -> str:
+    """Append a human-readable scope tag to a config_source path.
+
+    Same file name everywhere now (``.knowledge.yaml``), so the tag is
+    derived from *where* the file was found: the laptop default lives at
+    ``$HOME/.knowledge.yaml``; anything else is per-project (or per-subdir).
+    """
+
+    if source == "default":
+        return ""
+    try:
+        # Resolve both sides to match symlinks (macOS ``/tmp`` ↔
+        # ``/private/tmp`` etc. — settings.load_settings calls .resolve()
+        # on the discovered path, paths.config_path() does not).
+        if Path(source).resolve() == paths.config_path().resolve():
+            return "  (laptop default)"
+    except OSError:
+        pass
+    return "  (project)"
+
+
+def cmd_config_check_env(args: argparse.Namespace) -> int:
+    """Exit 0 if PG env vars are set (or mode is sqlite); exit 2 otherwise.
+
+    Designed for CI / shell scripts: ``knowledge config check-env || exit``.
+    """
+
+    from . import settings as settings_mod
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if s.mode == "sqlite":
+        print("mode: sqlite — env vars not required")
+        return 0
+
+    try:
+        settings_mod.resolve_pg_dsn(s)
+    except settings_mod.DsnError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print("ok: shared_postgresql credentials resolved from environment")
+    return 0
+
+
+_CONFIG_DISPATCH = {
+    "init": cmd_config_init,
+    "show": cmd_config_show,
+    "check-env": cmd_config_check_env,
+}
+
+
+# ---------------------------------------------------------------------------
+# db subcommands (Phase 1a)
+# ---------------------------------------------------------------------------
+
+
+def cmd_db_init_postgres(args: argparse.Namespace) -> int:
+    """Apply ``knowledge/schema/postgres/NNN_*.sql`` to the configured DB.
+
+    Refuses to run unless ``storage.mode == 'shared_postgresql'`` — there
+    is no scenario where a sqlite-only user benefits from creating a remote
+    PG schema. Migrations are idempotent (every CREATE uses IF NOT EXISTS),
+    so re-running is safe — handy when bumping the schema version later.
+    """
+
+    del args  # currently unused
+    from . import settings as settings_mod
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if s.mode != "shared_postgresql":
+        print(
+            "error: storage.mode is 'sqlite'. Set "
+            "storage.mode='shared_postgresql' in a discoverable .knowledge.yaml "
+            "(repo root or $HOME) "
+            "before running this.",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .backends.postgres import PostgresBackend, _DependencyMissing
+
+    backend = PostgresBackend(s)
+    try:
+        conn = backend.connect()
+    except _DependencyMissing as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except settings_mod.DsnError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — psycopg has many failure modes
+        print(f"error connecting to PostgreSQL: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        applied = backend.apply_schema(conn)
+    finally:
+        conn.close()
+
+    if applied:
+        print("applied:")
+        for name in applied:
+            print(f"  {name}")
+    else:
+        print("no migrations found (knowledge/schema/postgres/ is empty?)")
+    return 0
+
+
+def cmd_db_ping(args: argparse.Namespace) -> int:
+    """Connect to the configured backend, verify it works, close.
+
+    For sqlite: opens the local DB, runs a trivial SELECT, reports the file
+    path and a row-count from `meta`.
+
+    For shared_postgresql: opens psycopg, runs ``SELECT version()``, checks
+    that ``CREATE EXTENSION vector`` has been applied (else hints at
+    ``knowledge db init-postgres``), prints database name + role.
+
+    Exits 2 on any connection or auth failure. Read-only — safe to run
+    against production.
+    """
+
+    del args  # currently unused
+    from . import settings as settings_mod
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if s.mode == "sqlite":
+        return _ping_sqlite()
+    if s.mode == "shared_postgresql":
+        return _ping_postgres(s)
+    print(f"error: unknown storage mode {s.mode!r}", file=sys.stderr)
+    return 2
+
+
+def _ping_sqlite() -> int:
+    try:
+        with db.connect() as conn:
+            row = db.fetch_one(conn, "SELECT value FROM meta WHERE key = ?",
+                               ("schema_version",))
+            schema_version = row[0] if row else "unknown"
+            chunks = db.fetch_one(conn, "SELECT COUNT(*) FROM chunks")[0]
+    except Exception as exc:  # noqa: BLE001 — APSW has many failure modes
+        print(f"error opening sqlite DB: {exc}", file=sys.stderr)
+        return 2
+    print("ok: connected to sqlite")
+    print(f"  path:           {paths.db_path()}")
+    print(f"  schema_version: {schema_version}")
+    print(f"  chunks:         {chunks}")
+    return 0
+
+
+def _ping_postgres(s) -> int:
+    from . import settings as settings_mod
+    from .backends.postgres import PostgresBackend, _DependencyMissing
+
+    backend = PostgresBackend(s)
+    try:
+        conn = backend.connect()
+    except _DependencyMissing as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except settings_mod.DsnError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — psycopg has many failure modes
+        print(f"error connecting to PostgreSQL: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT version()")
+            pg_full = cur.fetchone()[0]
+            cur.execute(
+                "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+            )
+            row = cur.fetchone()
+            pgvector_version = row[0] if row else None
+            cur.execute("SELECT current_database(), current_user")
+            db_name, db_user = cur.fetchone()
+            cur.execute(
+                "SELECT to_regclass('public.projects') IS NOT NULL, "
+                "       to_regclass('public.chunk_embeddings') IS NOT NULL"
+            )
+            schema_ok, embeddings_ok = cur.fetchone()
+            project_count = 0
+            if schema_ok:
+                cur.execute("SELECT COUNT(*) FROM projects")
+                project_count = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    # PostgreSQL 17.0 (Debian 17.0-1.pgdg120+1) on aarch64-... ->
+    # extract just the version number for compactness.
+    pg_short = pg_full.split(" ", 2)[1] if pg_full.startswith("PostgreSQL ") else pg_full
+
+    print(f"ok: connected to {db_name!r} as {db_user!r}")
+    print(f"  postgres: {pg_short}")
+    if pgvector_version:
+        print(f"  pgvector: {pgvector_version}")
+    else:
+        print("  pgvector: NOT INSTALLED")
+        print("            run: knowledge db init-postgres")
+    if schema_ok and embeddings_ok:
+        print(f"  schema:   ready ({project_count} project(s) registered)")
+    else:
+        print("  schema:   NOT APPLIED")
+        print("            run: knowledge db init-postgres")
+    return 0
+
+
+def cmd_db_migrate(args: argparse.Namespace) -> int:
+    """Copy one project from local SQLite to the configured shared PG.
+
+    Two phases (mirrors :mod:`knowledge.migrate.sqlite_to_pg`):
+
+    1. Open both DBs, resolve the source project, validate
+       embedding-model match, check for a target conflict, count rows.
+    2. With ``--dry-run`` we stop here and print the plan. Otherwise we
+       prompt (suppressed by ``--yes``) and execute the copy in one PG
+       transaction.
+
+    Source SQLite is never modified — the local project row stays so you
+    can re-run if something goes wrong on the target side, or compare
+    side-by-side after a successful migrate.
+    """
+
+    from . import migrate, settings as settings_mod
+    from .backends.postgres import PostgresBackend, _DependencyMissing
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if s.mode != "shared_postgresql":
+        print(
+            "error: storage.mode is 'sqlite' — set 'shared_postgresql' in a "
+            "discoverable .knowledge.yaml before migrating.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Open both sides explicitly. db.connect() would dispatch on mode and
+    # give us PG; we need raw sqlite for the source.
+    sqlite_conn = db.connect_sqlite()
+
+    backend = PostgresBackend(s)
+    try:
+        pg_conn = backend.connect()
+    except _DependencyMissing as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except settings_mod.DsnError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — psycopg has many failure modes
+        print(f"error connecting to PostgreSQL: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        try:
+            plan = migrate.prepare(sqlite_conn, pg_conn, args.project)
+        except migrate.MigrationConflict as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except migrate.EmbeddingModelMismatch as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except migrate.MigrationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+        _print_plan(plan, settings=s)
+
+        if args.dry_run:
+            print("\ndry-run: nothing written. drop --dry-run to migrate.")
+            return 0
+
+        if not args.yes:
+            try:
+                answer = input("\nContinue? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\naborted.", file=sys.stderr)
+                return 1
+            if answer not in ("y", "yes"):
+                print("aborted.", file=sys.stderr)
+                return 1
+
+        print("\nmigrating...", flush=True)
+        try:
+            counts = migrate.execute(sqlite_conn, pg_conn, plan)
+        except migrate.MigrationConflict as exc:
+            print(f"\nerror: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001 — surfaces psycopg errors
+            print(f"\nerror during migrate: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        sqlite_conn.close()
+        pg_conn.close()
+
+    print("done. inserted on PG:")
+    for label, value in counts.items():
+        print(f"  {label:20s} {value}")
+    print(
+        f"\nsource SQLite still contains project {plan.project_name!r} "
+        f"(id={plan.sqlite_project_id}). Once you've verified the migrated "
+        "copy works, remove the local row with: "
+        f"knowledge forget {plan.project_name}"
+    )
+    return 0
+
+
+def _print_plan(plan, settings) -> None:
+    """Pretty-print a MigrationPlan for the user to confirm."""
+
+    print(f"source: local SQLite ({paths.db_path()})")
+    print(f"  project_id     {plan.sqlite_project_id}")
+    print(f"  name           {plan.project_name}")
+    print(f"  root           {plan.project_root}")
+    print(f"  git_remote     {plan.git_remote or '(none)'}")
+    print(f"  project_key    {plan.project_key_kind} = "
+          f"{plan.git_remote_normalized or plan.project_root.resolve()}")
+    print(f"  emb. model     {plan.source_embedding_model}")
+    print()
+
+    pg = settings.postgresql
+    if pg is not None:
+        print(f"target: shared PostgreSQL")
+        print(f"  host           {pg.host}")
+        print(f"  database       {pg.database}")
+        print(f"  user (env)     {pg.user_env}")
+        print(f"  emb. model     {plan.target_embedding_model}")
+    else:
+        print("target: shared PostgreSQL (configured)")
+    print()
+
+    print("rows to copy:")
+    print(f"  files               {plan.file_count}")
+    print(f"  chunks              {plan.chunk_count}")
+    print(f"  chunk embeddings    {plan.chunk_embedding_count}")
+    print(f"  file edges          {plan.edge_count}")
+    print(f"  project variables   {plan.variable_count}")
+    print(f"  history             {plan.history_count}")
+    print(f"  history embeddings  {plan.history_embedding_count}")
+    print(f"  decisions           {plan.decision_count}")
+    print(f"  decision embeddings {plan.decision_embedding_count}")
+
+
+_DB_DISPATCH = {
+    "ping": cmd_db_ping,
+    "init-postgres": cmd_db_init_postgres,
+    "migrate": cmd_db_migrate,
 }
 
 

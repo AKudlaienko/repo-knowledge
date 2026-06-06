@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+*.env
 .venv/
 venv/
 .pytest_cache/
@@ -14,3 +15,7 @@ venv/
 tasks/
 .idea/
 uv.lock
+*relations_graph.html
+CLAUDE.local.md
+AGENTS.local.md
+relations_graph.html

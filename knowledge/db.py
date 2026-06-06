@@ -29,11 +29,42 @@ Connection = apsw.Connection
 
 
 def connect(db_path: Path | None = None) -> Connection:
-    """Open the DB, load ``sqlite-vec``, turn on foreign keys + WAL.
+    """Open a connection to the configured backend.
 
-    Side-effect: ``init_schema(conn)`` is called on first open so callers
-    don't need to remember to bootstrap.
+    Default (``storage.mode = "sqlite"``): opens the SQLite DB at
+    ``~/.knowledge/index.sqlite`` (or ``db_path`` if given), loads
+    ``sqlite-vec``, enables foreign keys + WAL, runs schema bootstrap.
+
+    Shared mode (``storage.mode = "shared_postgresql"``): opens a psycopg3
+    connection via :class:`knowledge.backends.PostgresBackend`. ``db_path``
+    has no meaning and is rejected if non-None — caller likely passed it
+    by accident from a sqlite-era code path.
+
+    Both connection types work as transaction context managers (``with
+    conn:``), so the historical CLI pattern continues to work on PG.
     """
+
+    if current_mode() == "postgresql":
+        if db_path is not None:
+            raise ValueError(
+                "db_path is not applicable in shared_postgresql mode"
+            )
+        from . import backends
+
+        return backends.load_backend().connect()
+
+    return connect_sqlite(db_path)
+
+
+def connect_sqlite(db_path: Path | None = None) -> Connection:
+    """Open the SQLite DB regardless of ``storage.mode``.
+
+    Migration tooling that needs to read from local SQLite while writing
+    to PostgreSQL (or vice versa) calls this directly to bypass the
+    mode-aware dispatch in :func:`connect`. Same wiring as the legacy
+    sqlite path: APSW + sqlite-vec + WAL + ``init_schema``.
+    """
+
     target = db_path or paths.db_path()
     conn = apsw.Connection(str(target))
     conn.enable_load_extension(True)
@@ -106,6 +137,13 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_chunks_file    ON chunks(file_id)",
     "CREATE INDEX IF NOT EXISTS idx_chunks_parent  ON chunks(parent_id, sibling_order)",
     "CREATE INDEX IF NOT EXISTS idx_chunks_hash    ON chunks(content_hash)",
+    # Partial indexes for exact-name lookup (schema v2). `knowledge find`
+    # hits these for O(log n) lookups — anonymous chunks (markdown
+    # sections, shell blocks) skip the index entirely.
+    "CREATE INDEX IF NOT EXISTS idx_chunks_name  ON chunks(project_id, name) "
+    "WHERE name IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_chunks_qname ON chunks(project_id, qualified_name) "
+    "WHERE qualified_name IS NOT NULL",
     """
     CREATE TABLE IF NOT EXISTS history (
         id            INTEGER PRIMARY KEY,
@@ -160,6 +198,44 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_project_variables "
     "ON project_variables(project_id, scope)",
+    # query_cache (schema v2): per-project, per-HEAD-sha answer cache for
+    # `knowledge ask`. Keyed by (project_id, query_hash, head_sha); the
+    # hash already includes schema_version so v2→v3 upgrades invalidate
+    # automatically. TTL 1h on expires_at. Invalidated in bulk on
+    # build/update when ≥1 chunk changes (see indexer.py).
+    """
+    CREATE TABLE IF NOT EXISTS query_cache (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        query_hash  TEXT    NOT NULL,
+        head_sha    TEXT    NOT NULL,
+        result_json TEXT    NOT NULL,
+        created_at  REAL    NOT NULL,
+        expires_at  REAL    NOT NULL,
+        UNIQUE(project_id, query_hash, head_sha)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_query_cache_exp ON query_cache(expires_at)",
+    # decisions (schema v2): durable record of non-obvious choices made
+    # during sessions. Complements `history` (one entry per unit of work)
+    # with structured fields that make "what did we decide about X?"
+    # answerable without parsing prose. `files_touched` is a JSON array
+    # of rel_paths — not a FK table because most queries are "give me
+    # everything" rather than "which decisions touched file Y".
+    """
+    CREATE TABLE IF NOT EXISTS decisions (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        created_at    REAL    NOT NULL,
+        topic         TEXT    NOT NULL,
+        decision      TEXT    NOT NULL,
+        rationale     TEXT,
+        files_touched TEXT,
+        session_id    TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_decisions_proj_time "
+    "ON decisions(project_id, created_at DESC)",
 )
 
 
@@ -187,6 +263,78 @@ def init_schema(conn: Connection) -> None:
         )
         """
     )
+    # decisions_vec (schema v2): embeds ``topic || ' :: ' || decision``.
+    # Same shape as history_vec — cheap semantic search for "what did we
+    # decide about X?".
+    conn.execute(
+        f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS decisions_vec USING vec0(
+            decision_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{config.EMBEDDING_DIM}]
+        )
+        """
+    )
+
+    # chunks_fts (schema v2): FTS5 over chunk symbol names + stored_text
+    # for `knowledge grep`. Contentless (`content=''`) — we don't need
+    # highlight()/snippet(), just MATCH-for-rowid, so tokens-only halves
+    # the disk footprint vs storing a copy of stored_text.
+    #
+    # Triggers keep the FTS in sync with chunks. Contentless FTS5 DELETE
+    # requires the OLD content via the special 'delete' command — trivial
+    # from AFTER DELETE / AFTER UPDATE triggers which have OLD.* available,
+    # awkward to replicate as explicit indexer calls.
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            name,
+            qualified_name,
+            stored_text,
+            content=''
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, name, qualified_name, stored_text)
+            VALUES (new.id, new.name, new.qualified_name, new.stored_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, name, qualified_name, stored_text)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.stored_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, name, qualified_name, stored_text)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.stored_text);
+            INSERT INTO chunks_fts(rowid, name, qualified_name, stored_text)
+            VALUES (new.id, new.name, new.qualified_name, new.stored_text);
+        END
+        """
+    )
+
+    # v1 → v2 migration backfill. Contentless FTS5 `'delete'` commands require
+    # the OLD content to match what was indexed; feeding the trigger OLD rows
+    # that were never inserted into the FTS corrupts the index. On fresh v2
+    # DBs this branch is a no-op (both tables empty). On upgraded DBs it
+    # populates FTS once, so the first post-upgrade rebuild's DELETE triggers
+    # operate against consistent state. Guarded so we don't re-pay the cost
+    # on every connect.
+    fts_count = conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+    chunks_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    if chunks_count > 0 and fts_count == 0:
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, name, qualified_name, stored_text) "
+            "SELECT id, name, qualified_name, stored_text FROM chunks"
+        )
 
     # Seed versions on first run. APSW auto-commits outside of explicit
     # transaction blocks, so these INSERTs are durable immediately.
@@ -203,13 +351,276 @@ def init_schema(conn: Connection) -> None:
 
 
 def get_meta(conn: Connection, key: str) -> str | None:
-    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    row = fetch_one(conn, "SELECT value FROM meta WHERE key = ?", (key,))
     return row[0] if row else None
 
 
 def set_meta(conn: Connection, key: str, value: str) -> None:
-    conn.execute(
+    # ``ON CONFLICT(key) DO UPDATE`` works identically on SQLite (>=3.24)
+    # and PostgreSQL with the same syntax — the ``excluded`` pseudo-table
+    # is the standard upsert spelling.
+    execute(
+        conn,
         "INSERT INTO meta(key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backend dispatch (Phase 1a)
+#
+# ``connect()`` is the historical sqlite-only entry point — every existing
+# call site uses it and continues to in Phase 1a. ``get_backend()`` returns
+# a :class:`knowledge.backends.Backend` adapter (sqlite or postgres) for
+# the new dispatch-on-backend code paths landing in Phase 1b.
+#
+# Keeping both APIs side-by-side during the transition means we can move
+# call sites one feature at a time without breaking sqlite users.
+# ---------------------------------------------------------------------------
+
+
+def get_backend():
+    """Return the configured :class:`knowledge.backends.Backend`.
+
+    Single source of truth for "which storage am I talking to right now".
+    Cheap to call — no IO until you ``backend.connect()``.
+    """
+
+    from . import backends
+
+    return backends.load_backend()
+
+
+class ProjectBusyError(RuntimeError):
+    """Raised when a per-project advisory lock is held by another client.
+
+    On PostgreSQL, two `knowledge build` / `update` runs against the same
+    project must serialize — concurrent inserts would corrupt the
+    chunks/embeddings tables. We use ``pg_try_advisory_xact_lock`` (non-
+    blocking); if it fails, we raise this so the CLI can exit with code 3
+    rather than blocking the user. SQLite never raises (locks are no-ops).
+    """
+
+    def __init__(self, project_name: str) -> None:
+        self.project_name = project_name
+        super().__init__(
+            f"project {project_name!r} is being indexed by another client; retry"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-call-site dispatch helpers (Phase 1b)
+#
+# Feature modules (search.py, fts.py, indexer.py, …) carry SQL strings and
+# need to fork on backend at the small number of points where statements
+# differ (parameter style, last-insert-id, vec0 vs pgvector). Rather than
+# threading a Backend through every function signature, we expose a tiny
+# process-cached ``current_mode()`` and a couple of helpers that hide the
+# most common APSW-vs-psycopg shape differences. SQLite path is exactly
+# what it was before — nothing in this section is hit until a feature
+# module starts using these helpers.
+# ---------------------------------------------------------------------------
+
+
+@__import__("functools").lru_cache(maxsize=1)
+def current_mode() -> str:
+    """Return the **driver name** for the active config: ``"sqlite"`` or
+    ``"postgresql"``.
+
+    Note this is *not* the storage.mode literal from the YAML — the
+    config-facing name is ``"shared_postgresql"`` (descriptive), but the
+    driver-facing name is ``"postgresql"`` (matches
+    :attr:`knowledge.backends.PostgresBackend.name` and the dispatch
+    checks scattered through this module). The mapping happens here so
+    feature modules can compare against the short, driver-shaped string.
+
+    Result is cached per-process — settings are immutable for the
+    lifetime of a CLI invocation.
+    """
+
+    from . import settings as settings_mod
+
+    cfg_mode = settings_mod.load_settings().mode
+    return "postgresql" if cfg_mode == "shared_postgresql" else "sqlite"
+
+
+def execute_returning_id(conn, sql_no_returning: str, params: tuple) -> int:
+    """INSERT (using ``?`` placeholders) and return the new row's id.
+
+    ``sql_no_returning`` MUST use ``?`` placeholders; the helper rewrites
+    them to ``%s`` and appends ``RETURNING id`` for PostgreSQL. SQLite
+    keeps the original string unchanged.
+
+    Limited to single-row INSERTs whose target table has an integer PK
+    named ``id`` — everything in this codebase qualifies. Multi-row inserts
+    or RETURNING-multiple-cols need their own dispatch.
+    """
+
+    if current_mode() == "postgresql":
+        pg_sql = sql_no_returning.replace("?", "%s") + " RETURNING id"
+        with conn.cursor() as cur:
+            cur.execute(pg_sql, params)
+            row = cur.fetchone()
+            return int(row[0])
+    conn.execute(sql_no_returning, params)
+    return conn.last_insert_rowid()
+
+
+def fetch_one(conn, sql: str, params: tuple = ()):
+    """Run ``SELECT`` and return one row (tuple) or None.
+
+    Translates ``?`` to ``%s`` for PG; SQLite path is unchanged. Wraps the
+    psycopg cursor pattern so callers don't need ``with conn.cursor() as cur``
+    boilerplate just to read a single row.
+    """
+
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params)
+            return cur.fetchone()
+    return conn.execute(sql, params).fetchone()
+
+
+def fetch_all(conn, sql: str, params: tuple = ()):
+    """Run ``SELECT`` and return all rows. Same dispatch as :func:`fetch_one`."""
+
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params)
+            return cur.fetchall()
+    return conn.execute(sql, params).fetchall()
+
+
+def execute(conn, sql: str, params: tuple = ()) -> int:
+    """Run a write statement that doesn't return rows.
+
+    Returns the number of rows affected (0 if none, ``-1`` only when the
+    driver doesn't expose it — shouldn't happen on either backend in
+    practice). Existing callers that discard the return value are
+    unaffected; new callers can use the count for "did anything happen?"
+    success messages without a follow-up SELECT.
+    """
+
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params)
+            return cur.rowcount if cur.rowcount is not None else -1
+    conn.execute(sql, params)
+    # APSW's connection-level ``.changes()`` reports the row count of the
+    # most recent INSERT/UPDATE/DELETE; sufficient because we don't
+    # interleave statements between the call and this read.
+    return conn.changes() if hasattr(conn, "changes") else -1
+
+
+def transaction(conn):
+    """Backend-agnostic transaction context manager.
+
+    SQLite/APSW: ``with conn`` is the savepoint (commit on clean exit, roll
+    back on exception). PostgreSQL/psycopg: ``conn.transaction()`` does the
+    same. Returning the right object lets call sites write::
+
+        with db.transaction(conn):
+            ...mutations...
+
+    instead of forking on backend at every transaction boundary.
+    """
+
+    if current_mode() == "postgresql":
+        return conn.transaction()
+    return conn  # APSW Connection is its own context manager.
+
+
+def insert_chunk_embedding(conn, chunk_id: int, vec) -> None:
+    """Insert a single chunk vector into the per-backend table.
+
+    SQLite: ``chunks_vec`` virtual table, BLOB-encoded float array.
+    PostgreSQL: ``chunk_embeddings(chunk_id, embedding vector(384))`` —
+    pgvector accepts numpy arrays directly when ``register_vector`` was
+    called on the connection (PostgresBackend.connect handles that).
+    """
+
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chunk_embeddings(chunk_id, embedding) "
+                "VALUES (%s, %s)",
+                (chunk_id, vec),
+            )
+        return
+    conn.execute(
+        "INSERT INTO chunks_vec(chunk_id, embedding) VALUES (?, ?)",
+        (chunk_id, vec.tobytes()),
+    )
+
+
+def delete_chunk_embeddings_for_project(conn, project_id: int) -> None:
+    """Wipe vector rows for a project before a full rebuild.
+
+    SQLite: ``chunks_vec`` is a virtual table without FK cascade — must be
+    cleaned explicitly before the chunks rows it references go away.
+    PostgreSQL: ``chunk_embeddings.chunk_id`` has ``ON DELETE CASCADE`` to
+    ``chunks(id)`` — wiping ``chunks`` (which the indexer does next)
+    sweeps the embeddings automatically. This helper is a no-op on PG.
+    """
+
+    if current_mode() == "postgresql":
+        return
+    conn.execute(
+        "DELETE FROM chunks_vec WHERE chunk_id IN "
+        "(SELECT id FROM chunks WHERE project_id = ?)",
+        (project_id,),
+    )
+
+
+def delete_chunk_embeddings_by_ids(conn, chunk_ids: list[int]) -> None:
+    """Wipe embeddings for a list of chunk ids.
+
+    Same SQLite / PostgreSQL split as
+    :func:`delete_chunk_embeddings_for_project`. Used by the incremental
+    update path when chunks are about to be deleted.
+    """
+
+    if not chunk_ids:
+        return
+    if current_mode() == "postgresql":
+        return  # FK cascade on chunks DELETE handles it
+    placeholders = ",".join("?" * len(chunk_ids))
+    conn.execute(
+        f"DELETE FROM chunks_vec WHERE chunk_id IN ({placeholders})",
+        chunk_ids,
+    )
+
+
+def insert_history_embedding(conn, history_id: int, vec) -> None:
+    """Insert a history short-summary embedding into the per-backend table."""
+
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO history_embeddings(history_id, embedding) "
+                "VALUES (%s, %s)",
+                (history_id, vec),
+            )
+        return
+    conn.execute(
+        "INSERT INTO history_vec(history_id, embedding) VALUES (?, ?)",
+        (history_id, vec.tobytes()),
+    )
+
+
+def insert_decision_embedding(conn, decision_id: int, vec) -> None:
+    """Insert a decision-topic embedding into the per-backend table."""
+
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO decision_embeddings(decision_id, embedding) "
+                "VALUES (%s, %s)",
+                (decision_id, vec),
+            )
+        return
+    conn.execute(
+        "INSERT INTO decisions_vec(decision_id, embedding) VALUES (?, ?)",
+        (decision_id, vec.tobytes()),
     )
