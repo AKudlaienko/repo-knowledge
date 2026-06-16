@@ -47,3 +47,8 @@ class SqliteBackend:
     ) -> bool:
         del conn, project_id, exclusive  # explicitly unused
         return True
+
+    def connection_error_types(self) -> tuple[type[BaseException], ...]:
+        # Local file: there is no "connection lost" to recover from, so
+        # writes are never buffered to the outbox on SQLite.
+        return ()

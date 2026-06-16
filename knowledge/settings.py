@@ -4,29 +4,30 @@ This module is the single source of truth for *runtime* settings (which
 backend to talk to, how to assemble a DSN, etc.). Hardcoded build-time
 constants like the embedding model name still live in :mod:`knowledge.config`.
 
-Resolution rule (one file, one format, walk-up):
+Resolution rule (JSON, project-closer-wins, then laptop default):
 
 1. ``KNOWLEDGE_DATABASE_URL`` env (CI override) — full DSN, wins everything.
-2. Walk up from cwd to filesystem root looking for ``.knowledge.yaml``.
-   First match wins. The same file name is used at every scope — the file
-   *closer to the cwd* wins.
-3. If the walk found nothing, fall back to ``$HOME/.knowledge.yaml``
-   (covers the case where cwd is outside the user's home tree).
+2. Walk up from cwd to filesystem root looking for ``.knowledge-config.json``.
+   First match wins — the file *closer to the cwd* takes precedence.
+3. If the walk found nothing, fall back to ``~/.knowledge/config.json``
+   (the laptop default, inside the state dir).
 4. If still nothing, defaults (``mode = sqlite``).
 
-Same file name and same YAML schema everywhere — there's no "user JSON vs
-project YAML" split. Pick a scope by where you put the file:
+Same JSON schema at every scope. Pick a scope by where you put the file:
 
 * in your repo root → applies only inside that repo
-* in your home dir   → applies everywhere else on this laptop
+* ``~/.knowledge/config.json`` → applies everywhere else on this laptop
 
-Credentials never go on disk. The YAML carries env-var **names** only;
+Delete the project file and you fall straight back to the laptop default.
+
+Credentials never go on disk. The JSON carries env-var **names** only;
 actual values come from ``os.environ`` at connect time. ``config show``
 reports which file was selected so the active scope is never ambiguous.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,10 +41,33 @@ StorageMode = Literal["sqlite", "shared_postgresql"]
 _DEFAULT_USER_ENV = "KNOWLEDGE_PG_USER"
 _DEFAULT_PASSWORD_ENV = "KNOWLEDGE_PG_PASSWORD"
 
-# Forbidden top-level keys in any ``.knowledge.yaml``. Defense-in-depth on
-# top of CI lint of the example file: catches the "I'll just put my
-# password in here for testing" footgun before any network call.
+# Forbidden top-level keys in any config file. Defense-in-depth: catches the
+# "I'll just put my password in here for testing" footgun before any network
+# call.
 _FORBIDDEN_TOP_LEVEL = ("password", "user")
+
+# Template written by ``knowledge config init`` (see cli.cmd_config_init).
+# Lives here as a Python constant so ``knowledge/`` ships only ``*.py`` — no
+# example data file. sqlite by default; the postgresql block is an inert
+# example until ``storage.mode`` is flipped to ``shared_postgresql``.
+CONFIG_TEMPLATE_JSON = """\
+{
+  "storage": {
+    "mode": "sqlite",
+    "postgresql": {
+      "host": "db.example.com",
+      "port": 5432,
+      "database": "knowledge",
+      "sslmode": "require",
+      "user_env": "KNOWLEDGE_PG_USER",
+      "password_env": "KNOWLEDGE_PG_PASSWORD",
+      "connect_timeout_seconds": 10
+    }
+  },
+  "cache_bytes": 2147483648,
+  "embedding_model": null
+}
+"""
 
 
 @dataclass(frozen=True)
@@ -62,7 +86,7 @@ class Settings:
     """Loaded runtime settings.
 
     ``config_source`` is ``"default"`` when no file was found anywhere, or
-    the absolute path of the ``.knowledge.yaml`` that won the resolution.
+    the absolute path of the config file that won the resolution.
     """
 
     mode: StorageMode = "sqlite"
@@ -78,95 +102,110 @@ class Settings:
 
 
 class SettingsError(Exception):
-    """Raised when a discovered ``.knowledge.yaml`` is unparseable or invalid."""
+    """Raised when a discovered config file is unparseable or invalid."""
 
 
 def load_settings(start_dir: Path | None = None) -> Settings:
-    """Find the active ``.knowledge.yaml`` and load it.
+    """Find the active config file and load it.
 
     Walks up from ``start_dir`` (default cwd) to the filesystem root,
-    returning the first ``.knowledge.yaml`` found. If the walk exits
-    without a hit, falls back to ``$HOME/.knowledge.yaml`` (handy when
-    cwd is outside the home tree). Returns built-in defaults when nothing
-    is found anywhere.
+    returning the first ``.knowledge-config.json`` found. If the walk exits
+    without a hit, falls back to ``~/.knowledge/config.json`` (the laptop
+    default). Returns built-in defaults when nothing is found anywhere.
 
-    Malformed YAML or a forbidden field → :class:`SettingsError` (the CLI
+    ``KNOWLEDGE_DATABASE_URL`` overrides backend selection: when set it forces
+    ``mode = shared_postgresql`` (the DSN, with credentials inline, is itself
+    the whole target), so a container / CI run needs only that one env var and
+    no config file at all.
+
+    Malformed JSON or a forbidden field → :class:`SettingsError` (the CLI
     maps to exit code 2).
     """
 
-    yaml_path = _find_yaml(start_dir or Path.cwd())
-    if yaml_path is None:
+    url_override = os.environ.get("KNOWLEDGE_DATABASE_URL")
+
+    config_path = _find_config(start_dir or Path.cwd())
+    if config_path is None:
+        # A full DSN in the env is a self-sufficient PostgreSQL target (creds
+        # inline): it selects shared_postgresql by itself, so a container / CI
+        # job needs only this one variable and no config file. resolve_pg_dsn()
+        # returns the URL verbatim, so a null structured block is fine.
+        if url_override:
+            return Settings(
+                mode="shared_postgresql",
+                config_source="KNOWLEDGE_DATABASE_URL",
+            )
         return Settings()
 
-    raw = _parse_yaml(yaml_path) or {}
+    raw = _parse_json(config_path) or {}
     if not isinstance(raw, dict):
-        raise SettingsError(f"{yaml_path}: top level must be a mapping")
+        raise SettingsError(f"{config_path}: top level must be an object")
 
     for forbidden in _FORBIDDEN_TOP_LEVEL:
         if forbidden in raw:
             raise SettingsError(
-                f"{yaml_path}: top-level '{forbidden}' field is not allowed. "
-                f"Credentials must come from env vars (see config.example.env). "
+                f"{config_path}: top-level '{forbidden}' field is not allowed. "
+                f"Credentials must come from env vars. "
                 f"Use 'storage.postgresql.{forbidden}_env' to name the env var "
                 f"that holds the value."
             )
 
     storage = raw.get("storage", {}) or {}
-    pg_settings, mode = _parse_storage_block(storage, source=str(yaml_path))
+    pg_settings, mode = _parse_storage_block(storage, source=str(config_path))
 
     cache_bytes = int(raw.get("cache_bytes", 2 * 1024 * 1024 * 1024))
     embedding_model = raw.get("embedding_model")
     if embedding_model is not None and not isinstance(embedding_model, str):
         raise SettingsError(
-            f"{yaml_path}: embedding_model must be a string or null"
+            f"{config_path}: embedding_model must be a string or null"
         )
+
+    # KNOWLEDGE_DATABASE_URL wins over the file's storage.mode — the same
+    # precedence the resolution order has always documented. The file is still
+    # parsed so cache_bytes / embedding_model carry over; only the backend
+    # selection is overridden (resolve_pg_dsn returns the URL verbatim).
+    if url_override:
+        mode = "shared_postgresql"
 
     return Settings(
         mode=mode,
         postgresql=pg_settings,
         cache_bytes=cache_bytes,
         embedding_model=embedding_model,
-        config_source=str(yaml_path),
+        config_source=str(config_path),
     )
 
 
-def _find_yaml(start: Path) -> Path | None:
-    """Walk up from ``start`` looking for ``.knowledge.yaml``; home fallback.
+def _find_config(start: Path) -> Path | None:
+    """Walk up from ``start`` looking for ``.knowledge-config.json``; home fallback.
 
     Returns the closest match (cwd or any ancestor). If the walk-up runs
     off the filesystem root with no hit, also checks
-    ``$HOME/.knowledge.yaml`` so users running from a tmpdir or a
+    ``~/.knowledge/config.json`` so users running from a tmpdir or a
     non-home tree still pick up their laptop default.
     """
 
     p = start.resolve()
     for d in [p, *p.parents]:
-        candidate = d / ".knowledge.yaml"
+        candidate = d / paths.PROJECT_CONFIG_NAME
         if candidate.exists():
             return candidate
         if d == d.parent:
             break
 
-    home_default = paths.config_path()
+    home_default = paths.home_config_path()
     if home_default.exists():
         return home_default
     return None
 
 
-def _parse_yaml(path: Path):
-    """Load YAML from ``path``, with a clear error if PyYAML is unavailable."""
+def _parse_json(path: Path):
+    """Load JSON from ``path``, raising :class:`SettingsError` on bad JSON."""
 
     try:
-        import yaml  # type: ignore
-    except ImportError as exc:  # pragma: no cover — pyyaml is in core deps
-        raise SettingsError(
-            f"PyYAML is required to read {path}; reinstall the package"
-        ) from exc
-
-    try:
-        return yaml.safe_load(path.read_text("utf-8"))
-    except yaml.YAMLError as exc:
-        raise SettingsError(f"{path}: invalid YAML — {exc}") from None
+        return json.loads(path.read_text("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SettingsError(f"{path}: invalid JSON — {exc}") from None
 
 
 def _parse_storage_block(
@@ -273,7 +312,7 @@ def resolve_pg_dsn(settings: Settings) -> str:
     if pg is None:
         raise DsnError(
             "storage.postgresql block missing in config — "
-            "see knowledge/config.example.yaml for a template"
+            "run 'knowledge config init' to write a template"
         )
 
     user = os.environ.get(pg.user_env)
@@ -290,7 +329,7 @@ def resolve_pg_dsn(settings: Settings) -> str:
         raise DsnError(
             "missing PostgreSQL credentials in environment: "
             f"{', '.join(missing)}. "
-            "See knowledge/config.example.env — copy and source it, or set "
+            "Export them in your shell profile, or set "
             "KNOWLEDGE_DATABASE_URL for a one-shot CI override."
         )
 

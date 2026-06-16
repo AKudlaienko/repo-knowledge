@@ -104,6 +104,18 @@ class PostgresBackend:
         # needed.
         return self._lock_ctx(conn, project_id, exclusive=exclusive, blocking=True)
 
+    def connection_error_types(self) -> tuple[type[BaseException], ...]:
+        # psycopg raises OperationalError for a dropped/refused connection and
+        # InterfaceError when operating on an already-broken connection. Both
+        # mean "PG is unreachable" → buffer the write locally and retry later.
+        # Imported lazily so this is safe even before the optional extra is
+        # installed (returns () so buffering simply never fires).
+        try:
+            psycopg = _require_psycopg()
+        except _DependencyMissing:
+            return ()
+        return (psycopg.OperationalError, psycopg.InterfaceError)
+
     def try_advisory_lock_project(
         self, conn: Any, project_id: int, *, exclusive: bool = True
     ) -> bool:

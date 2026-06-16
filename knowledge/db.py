@@ -224,14 +224,22 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     # everything" rather than "which decisions touched file Y".
     """
     CREATE TABLE IF NOT EXISTS decisions (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        created_at    REAL    NOT NULL,
-        topic         TEXT    NOT NULL,
-        decision      TEXT    NOT NULL,
-        rationale     TEXT,
-        files_touched TEXT,
-        session_id    TEXT
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        created_at      REAL    NOT NULL,
+        topic           TEXT    NOT NULL,
+        decision        TEXT    NOT NULL,
+        rationale       TEXT,
+        files_touched   TEXT,
+        session_id      TEXT,
+        -- author / supersedes / override_reason: see init_schema() backfill.
+        -- author is stamped on every decision (git identity, UNIX-login
+        -- fallback) so shared-DB teammates can see who set each standard.
+        -- supersedes/override_reason are set only when a decision overrides
+        -- a prior one — the override gate requires a justification comment.
+        author          TEXT,
+        supersedes      INTEGER,
+        override_reason TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_decisions_proj_time "
@@ -336,6 +344,20 @@ def init_schema(conn: Connection) -> None:
             "SELECT id, name, qualified_name, stored_text FROM chunks"
         )
 
+    # Additive backfill for the decisions override gate. New nullable columns
+    # (author / supersedes / override_reason) are backward-compatible, so we
+    # do NOT bump SCHEMA_VERSION (that would force a destructive full rebuild).
+    # Old rows keep NULL; only newly recorded decisions populate them. Guarded
+    # by table_info so it's a no-op on already-migrated DBs.
+    have_cols = {row[1] for row in conn.execute("PRAGMA table_info(decisions)")}
+    for col, decl in (
+        ("author", "TEXT"),
+        ("supersedes", "INTEGER"),
+        ("override_reason", "TEXT"),
+    ):
+        if col not in have_cols:
+            conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {decl}")
+
     # Seed versions on first run. APSW auto-commits outside of explicit
     # transaction blocks, so these INSERTs are durable immediately.
     existing = dict(conn.execute("SELECT key, value FROM meta").fetchall())
@@ -390,6 +412,21 @@ def get_backend():
     from . import backends
 
     return backends.load_backend()
+
+
+def offline_errors() -> tuple[type[BaseException], ...]:
+    """Exception types meaning "the configured DB was unreachable".
+
+    Use in an ``except db.offline_errors():`` clause around user-authored
+    writes to buffer them to the local outbox instead of crashing. Returns
+    ``()`` on SQLite (no connection-loss concept) so the clause is inert there.
+    Never raises — a resolution failure degrades to ``()`` (don't swallow real
+    errors as "offline").
+    """
+    try:
+        return get_backend().connection_error_types()
+    except Exception:  # noqa: BLE001 — backend/dep resolution must not crash callers
+        return ()
 
 
 class ProjectBusyError(RuntimeError):

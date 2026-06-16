@@ -621,18 +621,24 @@ def _copy_decisions(
 ) -> dict[int, int]:
     rows = sqlite_conn.execute(
         "SELECT id, created_at, topic, decision, rationale, files_touched, "
-        "session_id FROM decisions WHERE project_id = ? ORDER BY id",
+        "session_id, author, supersedes, override_reason "
+        "FROM decisions WHERE project_id = ? ORDER BY id",
         (sqlite_pid,),
     ).fetchall()
     out: dict[int, int] = {}
-    for old_id, created_at, topic, decision, rationale, files_touched, session_id in rows:
+    for (old_id, created_at, topic, decision, rationale, files_touched,
+         session_id, author, supersedes, override_reason) in rows:
+        # supersedes points at another decision's local id. Rows are copied in
+        # ascending id order, so a superseded decision is always inserted
+        # before its overrider and its new id is already in ``out``.
+        new_supersedes = out.get(int(supersedes)) if supersedes is not None else None
         cur.execute(
             "INSERT INTO decisions("
             "project_id, created_at, topic, decision, rationale, "
-            "files_touched, session_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            "files_touched, session_id, author, supersedes, override_reason) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
             (new_pid, created_at, topic, decision, rationale,
-             files_touched, session_id),
+             files_touched, session_id, author, new_supersedes, override_reason),
         )
         out[int(old_id)] = int(cur.fetchone()[0])
     return out

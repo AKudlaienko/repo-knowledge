@@ -13,7 +13,9 @@ venv/
 .DS_Store
 .claude/
 tasks/
+tests/
 .idea/
+.aider.*
 uv.lock
 *relations_graph.html
 CLAUDE.local.md
