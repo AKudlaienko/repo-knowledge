@@ -1,7 +1,7 @@
 """Storage backends.
 
 Exactly one backend is active per ``knowledge`` invocation, selected from
-a discoverable ``.knowledge.yaml`` (see :mod:`knowledge.settings` for the
+a discoverable ``.knowledge-config.json`` (see :mod:`knowledge.settings` for the
 walk-up + home-fallback resolution):
 
 * :class:`SqliteBackend` — default, single-laptop, APSW + sqlite-vec.

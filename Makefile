@@ -1,4 +1,4 @@
-.PHONY: guide clean build install-local \
+.PHONY: guide clean build install-local test-integration \
         pg-build pg-run pg-stop pg-logs pg-psql pg-clean _check-pg-env
 
 PACKAGE_NAME := repo-knowledge
@@ -20,6 +20,13 @@ PG_DB_NAME     := knowledge
 
 clean:
 	rm -rfv dist build *.egg-info src/*.egg-info
+
+# Opt-in end-to-end test of shared-PostgreSQL team mode (needs Docker + the
+# [postgres] extra). Stands up an isolated pgvector container and two
+# simulated teammates; tears everything down on exit. Not part of the
+# lightweight build+smoke CI.
+test-integration:
+	bash tests/integration/shared_pg/run.sh
 
 build: clean
 	python -m pip install --upgrade build
@@ -44,7 +51,7 @@ _check-pg-env:
 		echo "  export KNOWLEDGE_PG_USER=postgres"; \
 		echo "  export KNOWLEDGE_PG_PASSWORD=\$$(openssl rand -hex 16)"; \
 		echo ""; \
-		echo "(See knowledge/config.example.env for a copy-able template.)"; \
+		echo "(Each developer carries their own credentials — see the 'Shared PostgreSQL' section in README.md.)"; \
 		exit 2; \
 	fi
 
@@ -76,9 +83,9 @@ pg-run: _check-pg-env pg-build
 	@echo "started: $(PG_CONTAINER) on localhost:$(PG_PORT) (db=$(PG_DB_NAME))"
 	@echo ""
 	@echo "Next steps on the laptop (knowledge CLI):"
-	@echo "  knowledge config init                # writes ~/.knowledge.yaml (laptop default)"
-	@echo "  # or: knowledge config init --project (writes <git-root>/.knowledge.yaml — closer wins)"
-	@echo "  # edit the file:"
+	@echo "  knowledge config init                # writes ~/.knowledge/config.json (laptop default)"
+	@echo "  # or: knowledge config init --project (writes <git-root>/.knowledge-config.json — closer wins)"
+	@echo "  # edit the JSON file (keys shown in dotted form):"
 	@echo "  #   storage.mode               = \"shared_postgresql\""
 	@echo "  #   storage.postgresql.host    = \"localhost\""
 	@echo "  #   storage.postgresql.sslmode = \"disable\"   # local docker has no TLS"

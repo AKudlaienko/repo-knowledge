@@ -70,3 +70,14 @@ class Backend(Protocol):
         appropriate ``project busy`` error on ``False``.
         """
         ...
+
+    def connection_error_types(self) -> tuple[type[BaseException], ...]:
+        """Exception types that mean "the database was unreachable".
+
+        Lets callers buffer user-authored writes to a local outbox instead of
+        crashing when the configured backend can't be reached. SQLite returns
+        ``()`` (local file — no connection-loss concept), so the buffering
+        clause is a no-op there. PostgreSQL returns psycopg's connection-class
+        errors.
+        """
+        ...

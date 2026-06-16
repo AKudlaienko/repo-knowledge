@@ -167,6 +167,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Files touched by this decision (optional)",
     )
     p_decide.add_argument("--session-id", help="Tag with session identifier")
+    p_decide.add_argument(
+        "--supersede",
+        type=int,
+        metavar="ID",
+        help="Override an existing decision (its id). Requires --override-reason.",
+    )
+    p_decide.add_argument(
+        "--override-reason",
+        help="Why you are overriding the --supersede'd decision (required with it).",
+    )
     p_decide.add_argument("--project", help="Scope to a specific project (name or abs path)")
 
     # decisions — list / search past decisions.
@@ -456,24 +466,25 @@ def main(argv: list[str] | None = None) -> int:
     # (just reports "mode: sqlite").
     p_config = sub.add_parser(
         "config",
-        help="Inspect / initialize .knowledge.yaml (storage mode, PG env)",
+        help="Inspect / initialize .knowledge-config.json (storage mode, PG env)",
     )
     p_config_sub = p_config.add_subparsers(dest="config_cmd", required=True)
 
     p_cfg_init = p_config_sub.add_parser(
         "init",
-        help="Write a .knowledge.yaml: $HOME by default, --project for the git root",
+        help="Write a config file: ~/.knowledge/config.json by default, "
+             "--project for the git root",
     )
     p_cfg_init.add_argument(
         "--project",
         action="store_true",
-        help="Write to <git-root>/.knowledge.yaml instead of $HOME/.knowledge.yaml. "
-             "Same schema either way; the closer file wins at runtime.",
+        help="Write <git-root>/.knowledge-config.json instead of the laptop "
+             "default. Same schema either way; the closer file wins at runtime.",
     )
     p_cfg_init.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite an existing .knowledge.yaml at the chosen target",
+        help="Overwrite an existing config file at the chosen target",
     )
 
     p_cfg_show = p_config_sub.add_parser(
@@ -546,7 +557,20 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
-    return _DISPATCH[args.cmd](args)
+    try:
+        return _DISPATCH[args.cmd](args)
+    except db.offline_errors():
+        # Safety net for the read commands (ask/find/grep/search/resume/
+        # decisions/…): they need the shared DB and can't be served offline.
+        # Write commands handle this themselves by buffering to the outbox,
+        # so they won't reach here. Clean message instead of a raw traceback.
+        print(
+            "error: shared index unreachable (PostgreSQL is down or "
+            "unconfigured). Reads need the DB; any writes are buffered locally "
+            "and sync on the next reachable run.",
+            file=sys.stderr,
+        )
+        return 4
 
 
 # ---------------------------------------------------------------------------
@@ -555,13 +579,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    from . import indexer
+    from . import indexer, outbox
 
     root = projects.current_project_root()
     proposed_name = args.name or root.name
     print(f"building index for: {root}", flush=True)
 
     with db.connect() as conn:
+        outbox.drain(conn, root)  # opportunistic flush of any buffered backlog
         # Rebuild in place? If a row already exists at this exact root, it's
         # not a collision — just a re-build of the same project. Skip the
         # collision check so the user isn't prompted on every rebuild.
@@ -622,12 +647,18 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 
 def cmd_update(args: argparse.Namespace) -> int:
-    from . import indexer
+    from . import indexer, outbox
 
     root = projects.current_project_root()
     print(f"updating index for: {root}", flush=True)
     t0 = time.time()
     with db.connect() as conn:
+        # The post-edit hook runs `update` often → a reliable, frequent moment
+        # to flush any locally buffered decisions/history now the DB is up.
+        synced = outbox.drain(conn, root)
+        if synced:
+            print(f"synced {synced} locally-buffered entr"
+                  f"{'y' if synced == 1 else 'ies'} to the shared DB", flush=True)
         try:
             project_id, files_visited, chunks_embedded = indexer.update_project(
                 conn, root, name_override=None
@@ -884,7 +915,7 @@ def _first_line(text: str, max_chars: int = 160) -> str:
 
 def cmd_decide(args: argparse.Namespace) -> int:
     """Record a decision — Phase 4 session memory."""
-    from . import decisions as decisions_mod
+    from . import outbox
 
     topic = args.topic.strip()
     decision = args.decision.strip()
@@ -892,11 +923,107 @@ def cmd_decide(args: argparse.Namespace) -> int:
         print("error: topic and --decision must be non-empty", file=sys.stderr)
         return 2
 
+    override_reason = (args.override_reason or "").strip() or None
+    if override_reason and args.supersede is None:
+        print(
+            "error: --override-reason is only valid together with --supersede <id>",
+            file=sys.stderr,
+        )
+        return 2
+
+    # `decide` should work even before a `build`; auto-create the project row
+    # the same way `history add` does. Author is stamped on every decision so
+    # shared-DB teammates can see who set each standard.
+    root = projects.current_project_root()
+    author = projects.current_author(root)
+
+    try:
+        return _decide_online(args, root, author, topic, decision, override_reason)
+    except db.offline_errors() as exc:
+        # Shared DB unreachable — buffer locally instead of crashing. Enforce
+        # the override gate without the DB (the comment requirement is policy,
+        # not a lookup); the prior-decision detail just isn't available offline.
+        if args.supersede is not None and not override_reason:
+            print(
+                f"error: overriding decision id={args.supersede} requires "
+                f'--override-reason "<why>" (shared DB offline — prior '
+                f"details unavailable).",
+                file=sys.stderr,
+            )
+            return 3
+        outbox.append(
+            "decision",
+            root,
+            {
+                "topic": topic,
+                "decision": decision,
+                "rationale": args.rationale,
+                "files_touched": args.files,
+                "session_id": args.session_id,
+                "author": author,
+                "supersedes": args.supersede,
+                "override_reason": override_reason if args.supersede else None,
+            },
+        )
+        print(
+            "note: shared DB unreachable — decision buffered locally; "
+            "will sync on the next reachable run."
+        )
+        return 0
+
+
+def _decide_online(args, root, author, topic, decision, override_reason) -> int:
+    """The DB-backed decide path. Raises ``db.offline_errors()`` if PG is
+    unreachable; ``cmd_decide`` catches that and buffers to the outbox."""
+    from datetime import datetime
+
+    from . import decisions as decisions_mod
+    from . import outbox
+
     with db.connect() as conn:
-        # `decide` should work even before a `build`; auto-create the project
-        # row the same way `history add` does.
-        root = projects.current_project_root()
+        outbox.drain(conn, root)  # push any backlog now that the DB is reachable
         proj = projects.get_or_create_project(conn, root)
+
+        supersedes: int | None = None
+        if args.supersede is not None:
+            # --- Override gate ---------------------------------------------
+            # Overriding a teammate's standard is exactly the case where
+            # others rely on the old behavior, so we hard-block until a
+            # justification comment is supplied (non-interactive: exit 3,
+            # like the indexer's busy path).
+            target = decisions_mod.get(conn, args.supersede)
+            if target is None or target.project_id != proj.id:
+                print(
+                    f"error: no decision id={args.supersede} in "
+                    f"'{proj.name}' ({proj.root_path})",
+                    file=sys.stderr,
+                )
+                return 2
+            if not override_reason:
+                prior_when = datetime.fromtimestamp(
+                    target.created_at
+                ).strftime("%Y-%m-%d")
+                prior_by = target.author or "unknown"
+                print(
+                    f"⚠️  overriding decision id={target.id} "
+                    f"'{target.topic}' (set {prior_when} by {prior_by}).\n"
+                    f"    decision: {target.decision}\n"
+                    f"error: overriding a prior decision requires "
+                    f'--override-reason "<why>" — teammates rely on it.',
+                    file=sys.stderr,
+                )
+                return 3
+            supersedes = target.id
+
+        # Non-blocking nudge: same-topic re-use without an explicit override is
+        # usually an unintended fork of an existing standard. Look up the prior
+        # match BEFORE inserting so we don't match the new row itself.
+        prior = (
+            decisions_mod.exact_topic_match(conn, proj.id, topic)
+            if supersedes is None
+            else None
+        )
+
         new_id = decisions_mod.add(
             conn,
             project_id=proj.id,
@@ -905,8 +1032,25 @@ def cmd_decide(args: argparse.Namespace) -> int:
             rationale=args.rationale,
             files_touched=args.files,
             session_id=args.session_id,
+            author=author,
+            supersedes=supersedes,
+            override_reason=override_reason if supersedes else None,
         )
-    print(f"recorded decision id={new_id} in '{proj.name}' ({proj.root_path})")
+
+        if prior is not None:
+            prior_by = f" by {prior.author}" if prior.author else ""
+            print(
+                f"note: decision id={prior.id} already covers topic "
+                f"'{topic}'{prior_by}; pass --supersede {prior.id} "
+                f"if you mean to override it.",
+                file=sys.stderr,
+            )
+
+    suffix = f" (supersedes id={supersedes})" if supersedes else ""
+    print(
+        f"recorded decision id={new_id} by {author} in "
+        f"'{proj.name}' ({proj.root_path}){suffix}"
+    )
     return 0
 
 
@@ -979,11 +1123,15 @@ def _print_decisions(entries) -> None:
     for d, dist in entries:
         when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d %H:%M")
         dist_s = f"  dist={dist:.3f}" if dist is not None else ""
-        print(f"{when}  id={d.id}{dist_s}")
+        by = f"  by {d.author}" if d.author else ""
+        print(f"{when}  id={d.id}{by}{dist_s}")
         print(f"  topic:    {d.topic}")
         print(f"  decision: {d.decision}")
         if d.rationale:
             print(f"  why:      {d.rationale}")
+        if d.supersedes:
+            ovr = f" — {d.override_reason}" if d.override_reason else ""
+            print(f"  overrides: id={d.supersedes}{ovr}")
         if d.files_touched:
             print(f"  files:    {', '.join(d.files_touched)}")
 
@@ -1005,7 +1153,9 @@ def _print_resume(rb) -> None:
     else:
         for d in rb.last_decisions:
             when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d")
-            print(f"  {when}  {d.topic}")
+            by = f"  ({d.author})" if d.author else ""
+            ovr = f"  [overrides id={d.supersedes}]" if d.supersedes else ""
+            print(f"  {when}  {d.topic}{by}{ovr}")
             print(f"            → {d.decision}")
 
     # 2. Touched files
@@ -1749,21 +1899,39 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 
 def cmd_history_add(args: argparse.Namespace) -> int:
-    from . import history
+    from . import history, outbox
 
-    with db.connect() as conn:
-        root = projects.current_project_root()
-        proj = projects.get_or_create_project(conn, root)
-        hid = history.add(
-            conn,
-            project_id=proj.id,
-            short_summary=args.short,
-            long_summary=args.long,
-            session_id=args.session_id,
-            tags=args.tags,
+    root = projects.current_project_root()
+    try:
+        with db.connect() as conn:
+            outbox.drain(conn, root)
+            proj = projects.get_or_create_project(conn, root)
+            hid = history.add(
+                conn,
+                project_id=proj.id,
+                short_summary=args.short,
+                long_summary=args.long,
+                session_id=args.session_id,
+                tags=args.tags,
+            )
+        print(f"added history entry id={hid} in project '{proj.name}' ({proj.root_path})")
+        return 0
+    except db.offline_errors():
+        outbox.append(
+            "history",
+            root,
+            {
+                "short_summary": args.short,
+                "long_summary": args.long,
+                "session_id": args.session_id,
+                "tags": args.tags,
+            },
         )
-    print(f"added history entry id={hid} in project '{proj.name}' ({proj.root_path})")
-    return 0
+        print(
+            "note: shared DB unreachable — history entry buffered locally; "
+            "will sync on the next reachable run."
+        )
+        return 0
 
 
 def cmd_history_stage(args: argparse.Namespace) -> int:
@@ -2746,35 +2914,35 @@ _DISPATCH = {
 
 
 def cmd_config_init(args: argparse.Namespace) -> int:
-    """Write a ``.knowledge.yaml`` at the chosen scope.
+    """Write a config file at the chosen scope.
 
-    Default target: ``$HOME/.knowledge.yaml`` (laptop default).
-    With ``--project``: ``<git-root>/.knowledge.yaml`` (per-repo override).
+    Default target: ``~/.knowledge/config.json`` (laptop default).
+    With ``--project``: ``<git-root>/.knowledge-config.json`` (per-repo override).
 
-    Same file name and schema at every scope; resolution at runtime walks
-    up from cwd and uses the closest match (with $HOME as last-resort
+    Same JSON schema at every scope; resolution at runtime walks up from cwd
+    and uses the closest match (with the laptop default as last-resort
     fallback). So ``--project`` is just "put it closer", nothing more.
 
     Refuses to overwrite an existing file unless ``--force`` is passed.
     """
 
+    from . import settings as settings_mod
+
     if getattr(args, "project", False):
-        dst = projects.current_project_root() / ".knowledge.yaml"
+        dst = projects.current_project_root() / paths.PROJECT_CONFIG_NAME
         scope = "project"
     else:
-        dst = paths.config_path()
+        dst = paths.home_config_path()
         scope = "laptop default"
 
     if dst.exists() and not args.force:
         print(f"{dst} already exists. Use --force to overwrite.", file=sys.stderr)
         return 1
 
-    src = Path(__file__).parent / "config.example.yaml"
-    dst.write_text(src.read_text("utf-8"), encoding="utf-8")
+    dst.write_text(settings_mod.CONFIG_TEMPLATE_JSON, encoding="utf-8")
     print(f"wrote {dst}  ({scope})")
-    print("next: edit storage.mode if you want shared_postgresql, then")
-    print("      copy knowledge/config.example.env to your shell profile and")
-    print("      export KNOWLEDGE_PG_USER / KNOWLEDGE_PG_PASSWORD.")
+    print("next: set storage.mode to 'shared_postgresql' if you want PG, then")
+    print("      export KNOWLEDGE_PG_USER / KNOWLEDGE_PG_PASSWORD in your shell.")
     print("      knowledge config show  # confirms which file is in effect")
     return 0
 
@@ -2819,9 +2987,9 @@ def cmd_config_show(args: argparse.Namespace) -> int:
 def _describe_source(source: str) -> str:
     """Append a human-readable scope tag to a config_source path.
 
-    Same file name everywhere now (``.knowledge.yaml``), so the tag is
-    derived from *where* the file was found: the laptop default lives at
-    ``$HOME/.knowledge.yaml``; anything else is per-project (or per-subdir).
+    The tag is derived from *where* the file was found: the laptop default
+    lives at ``~/.knowledge/config.json``; anything else is a per-project
+    ``.knowledge-config.json`` (or per-subdir).
     """
 
     if source == "default":
@@ -2829,8 +2997,8 @@ def _describe_source(source: str) -> str:
     try:
         # Resolve both sides to match symlinks (macOS ``/tmp`` ↔
         # ``/private/tmp`` etc. — settings.load_settings calls .resolve()
-        # on the discovered path, paths.config_path() does not).
-        if Path(source).resolve() == paths.config_path().resolve():
+        # on the discovered path, paths.home_config_path() does not).
+        if Path(source).resolve() == paths.home_config_path().resolve():
             return "  (laptop default)"
     except OSError:
         pass
@@ -2897,8 +3065,8 @@ def cmd_db_init_postgres(args: argparse.Namespace) -> int:
     if s.mode != "shared_postgresql":
         print(
             "error: storage.mode is 'sqlite'. Set "
-            "storage.mode='shared_postgresql' in a discoverable .knowledge.yaml "
-            "(repo root or $HOME) "
+            "storage.mode='shared_postgresql' in a discoverable "
+            ".knowledge-config.json (repo root or ~/.knowledge/config.json) "
             "before running this.",
             file=sys.stderr,
         )
@@ -3068,7 +3236,7 @@ def cmd_db_migrate(args: argparse.Namespace) -> int:
     if s.mode != "shared_postgresql":
         print(
             "error: storage.mode is 'sqlite' — set 'shared_postgresql' in a "
-            "discoverable .knowledge.yaml before migrating.",
+            "discoverable .knowledge-config.json before migrating.",
             file=sys.stderr,
         )
         return 2

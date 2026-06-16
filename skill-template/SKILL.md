@@ -7,7 +7,7 @@ allowed-tools: Bash Read
 
 # /knowledge — Code cartography + semantic search + session memory
 
-Default: one SQLite DB at `~/.knowledge/index.sqlite` holds chunks, edges, history, and decisions for every repo the user has indexed. **Team shared mode** (optional, per-project): drop a `.knowledge.yaml` (template at `knowledge/config.example.yaml`) in the repo root or in `$HOME` with `storage.mode: shared_postgresql`; closer-to-cwd file wins, so project A can live in shared PG while project B stays on local sqlite. Credentials are env-vars on each laptop (`KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD` — never commit values; see `knowledge/config.example.env`). Complements `Grep` (exact text) for meaning-shaped questions.
+Default: one SQLite DB at `~/.knowledge/index.sqlite` holds chunks, edges, history, and decisions for every repo the user has indexed. **Team shared mode** (optional, per-project): write a `.knowledge-config.json` (via `knowledge config init --project`) in the repo root, or `~/.knowledge/config.json` for the laptop default, with `storage.mode: shared_postgresql`; closer-to-cwd file wins, so project A can live in shared PG while project B stays on local sqlite. Credentials are env-vars on each laptop (`KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD` — never commit values; the JSON carries env-var names only). Complements `Grep` (exact text) for meaning-shaped questions.
 
 ## Priority directives — READ FIRST
 
@@ -46,11 +46,11 @@ Before drafting a plan, before writing/editing any file, and before each major s
 > - **History** `<id>` (`<date>`): `<one-line summary of what happened / what was fixed>`
 > - **Why this matters now**: `<concrete reason the proposed change re-opens the same problem>`
 > - **Options**:
->   1. Proceed and supersede the prior decision — I will record a new `knowledge decide` explaining the reversal.
+>   1. Proceed and supersede the prior decision — I will record a new `knowledge decide --supersede <id> --override-reason "<why>"` explaining the reversal.
 >   2. Adapt the plan to honor the prior decision (preferred default).
 >   3. Need clarification from you.
 
-If the user explicitly chooses (1), record a new `knowledge decide` referencing and superseding the old one as part of the change. Never overwrite history silently.
+If the user explicitly chooses (1), record the override with `knowledge decide <topic> --decision "<new>" --supersede <id> --override-reason "<why>"`. The tool **blocks** (exit 3) until you supply `--override-reason`, and stamps the overriding author — so the reversal is attributable to whoever made it, which matters most in shared-DB mode where teammates rely on the old behavior. Never overwrite history silently.
 
 ## Finding code — intent → verb
 
@@ -92,11 +92,11 @@ Branch on `state`:
 The skill talks to whichever backend the current cwd resolves to. Resolution order:
 
 1. `KNOWLEDGE_DATABASE_URL` env (CI override) — full DSN, wins everything.
-2. Walk cwd → its parents looking for `.knowledge.yaml` — first match wins.
-3. `$HOME/.knowledge.yaml` — laptop-wide default.
+2. Walk cwd → its parents looking for `.knowledge-config.json` — first match wins.
+3. `~/.knowledge/config.json` — laptop-wide default.
 4. Built-in default: SQLite at `~/.knowledge/index.sqlite`.
 
-Same name + same YAML schema at every scope; the closer file wins, so project A on shared PG and project B on local SQLite is fine on the same laptop. Two ways to check what's active right now:
+Same JSON schema at every scope; the closer file wins, so project A on shared PG and project B on local SQLite is fine on the same laptop. Two ways to check what's active right now:
 
 ```bash
 knowledge config show         # mode + masked DSN + which file is active
@@ -104,6 +104,17 @@ knowledge db ping             # opens the connection, version + schema status (r
 ```
 
 When a verb fails with `psycopg.ProgrammingError` or `missing PostgreSQL credentials` — first thing to do is `knowledge config show` and `knowledge config check-env`. Credentials live only in env (`KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD`), never in any committed file.
+
+### Offline / connection-loss (shared PG)
+
+Concurrency is **non-blocking**: reads never lock; `build`/`update` use a non-blocking advisory lock, so a concurrent index run on the *same* project fails fast (exit 3 "being indexed by another client; retry") instead of waiting — no one ever blocks anyone, and deadlock is impossible.
+
+If the shared DB is **unreachable**, user-authored writes are not lost and don't crash:
+
+- `knowledge decide` and direct `knowledge history add` **buffer locally** to `~/.knowledge/stage/<slug>/outbox.jsonl` and exit 0 with a `buffered locally` note.
+- The buffer **auto-syncs** on the next reachable command (`update`/`build`/`decide`/`history add` drain it on connect) — `update` prints `synced N … entries`.
+- **Reads** (`ask`/`find`/`grep`/`search`/`resume`/`decisions`) can't be served offline — they exit **4** with a clear "shared index unreachable" message (no traceback, no stale fallback).
+- Index `build`/`update` while offline also exit 4 — chunks are re-derivable, so just re-run when the DB is back. Only irreplaceable user-authored data (decisions/history) is buffered. SQLite mode is unaffected (local — there's no connection to lose).
 
 For migrating an existing local-SQLite project to a PG container, use `knowledge db migrate --project <name> --dry-run` to preview, then drop `--dry-run`. The local SQLite copy is never modified.
 
@@ -184,6 +195,21 @@ knowledge decide "cache invalidation" \
 ```
 
 Topic + decision are the keys. Rationale and file list are optional but valuable — the rationale is what future-you actually needs to remember.
+
+Every decision is **stamped with an author** (git `user.name <user.email>`, falling back to the UNIX login when there's no git identity) — so in shared-DB mode teammates can see who set each standard.
+
+**Overriding a prior decision** (changing an established standard) requires an explicit acknowledgment:
+
+```bash
+knowledge decide "cache invalidation" \
+  --decision "wipe on every update, no no-op preservation" \
+  --supersede 42 \
+  --override-reason "no-op detection was unreliable on PG; correctness over thrash"
+```
+
+- `--supersede <id>` links the new decision to the one it overrides.
+- The tool **blocks (exit 3)** until `--override-reason "<why>"` is supplied — a teammate relying on the old behavior deserves to know why it changed.
+- A plain `decide` whose topic exactly matches an existing one prints a non-blocking `note:` nudging you toward `--supersede` (it does not block — same topic is sometimes legitimate).
 
 ### `decisions` — list or semantically search
 

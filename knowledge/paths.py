@@ -33,22 +33,25 @@ def models_dir() -> Path:
     return p
 
 
-def config_path() -> Path:
-    """Laptop-default config file location (``~/.knowledge.yaml``).
+# Project-scoped config file name. Dropped into a repo root (or any cwd
+# ancestor); the file *closer to the cwd* wins over the laptop default.
+PROJECT_CONFIG_NAME = ".knowledge-config.json"
+
+
+def home_config_path() -> Path:
+    """Laptop-default config file location (``~/.knowledge/config.json``).
 
     This is the file ``knowledge config init`` writes by default. At runtime
-    the same file is also discoverable via the cwd walk-up done in
+    it's the last stop in the resolution done by
     :func:`knowledge.settings.load_settings` — every search ends here when
-    nothing closer to the cwd has a ``.knowledge.yaml``. Same shape as the
-    in-repo file so callers can move config from one scope to the other
-    by copying.
+    nothing closer to the cwd has a ``.knowledge-config.json``. Same JSON
+    schema as the in-repo file, so config moves between scopes by copying.
 
-    Note: this lives at ``$HOME/.knowledge.yaml`` (a *file* in home), not
-    inside ``$HOME/.knowledge/`` (the state directory holding the sqlite
-    DB, models cache, and stage files). Two distinct paths, two distinct
-    purposes.
+    Unlike the legacy ``$HOME/.knowledge.yaml``, this lives *inside*
+    ``$HOME/.knowledge/`` (the state directory holding the sqlite DB, models
+    cache, and stage files) — one home for all per-laptop knowledge state.
     """
-    return Path.home() / ".knowledge.yaml"
+    return user_dir() / "config.json"
 
 
 def stage_dir() -> Path:
@@ -117,6 +120,17 @@ def project_stage_dir(root: Path) -> Path:
 def session_stage_file(root: Path) -> Path:
     """Per-session JSONL inside the project-stage dir."""
     return project_stage_dir(root) / f"sess-{_session_id()}.jsonl"
+
+
+def outbox_file(root: Path) -> Path:
+    """Failure buffer for user-authored writes (decisions/history) that
+    couldn't reach the shared DB.
+
+    One JSONL file per project under the same project-stage dir, with a
+    distinct name so it never collides with the per-session ``sess-*.jsonl``
+    history stage files. Drained on the next reachable ``knowledge`` command.
+    """
+    return project_stage_dir(root) / "outbox.jsonl"
 
 
 def root_sidecar_path(project_dir: Path) -> Path:

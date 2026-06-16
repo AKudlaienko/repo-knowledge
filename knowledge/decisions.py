@@ -36,11 +36,14 @@ class Decision(NamedTuple):
     rationale: str | None
     files_touched: list[str]      # parsed from JSON; always a list (possibly empty)
     session_id: str | None
+    author: str | None            # who recorded it (git identity / UNIX login)
+    supersedes: int | None        # id of the decision this one overrides
+    override_reason: str | None   # justification comment for the override
 
 
 _SELECT_COLS = (
     "id, project_id, created_at, topic, decision, rationale, "
-    "files_touched, session_id"
+    "files_touched, session_id, author, supersedes, override_reason"
 )
 
 
@@ -52,12 +55,19 @@ def add(
     rationale: str | None = None,
     files_touched: list[str] | None = None,
     session_id: str | None = None,
+    author: str | None = None,
+    supersedes: int | None = None,
+    override_reason: str | None = None,
 ) -> int:
     """Insert one decision + its embedding. Returns new row id.
 
     Embedded text is ``topic || ' :: ' || decision`` — both fields matter
     for retrieval, and the separator keeps tokenization from bleeding
     one into the other.
+
+    ``author`` is stamped on every decision for shared-DB attribution.
+    ``supersedes`` / ``override_reason`` are set together only when this
+    decision overrides a prior one (the CLI enforces the justification).
     """
     text_to_embed = f"{topic} :: {decision}"
     vec = get_embedder().encode([text_to_embed])[0]
@@ -69,11 +79,36 @@ def add(
             conn,
             "INSERT INTO decisions("
             "project_id, created_at, topic, decision, rationale, "
-            "files_touched, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (project_id, now, topic, decision, rationale, files_json, session_id),
+            "files_touched, session_id, author, supersedes, override_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (project_id, now, topic, decision, rationale, files_json,
+             session_id, author, supersedes, override_reason),
         )
         db.insert_decision_embedding(conn, new_id, vec)
     return new_id
+
+
+def exact_topic_match(
+    conn: Connection, project_id: int, topic: str
+) -> Decision | None:
+    """Newest decision in this project whose topic equals ``topic``
+    (case-insensitive), or ``None``. Used for the non-blocking "you may mean
+    to supersede id=N" nudge on a plain ``decide``.
+    """
+    # Exact (not substring) equality, case-insensitive. Avoid LIKE here so a
+    # literal % or _ in a topic label isn't treated as a wildcard.
+    if db.current_mode() == "postgresql":
+        pred = "LOWER(topic) = LOWER(?)"
+    else:
+        pred = "topic = ? COLLATE NOCASE"
+    row = db.fetch_one(
+        conn,
+        f"SELECT {_SELECT_COLS} FROM decisions "
+        f"WHERE project_id = ? AND {pred} "
+        f"ORDER BY created_at DESC LIMIT ?",
+        (project_id, topic, 1),
+    )
+    return _row_to_decision(row) if row else None
 
 
 def get(conn: Connection, decision_id: int) -> Decision | None:
@@ -210,4 +245,7 @@ def _row_to_decision(row) -> Decision:
         rationale=row[5],
         files_touched=files,
         session_id=row[7],
+        author=row[8],
+        supersedes=row[9],
+        override_reason=row[10],
     )

@@ -1,7 +1,7 @@
 """All hardcoded constants live here.
 
-Anything that might be tuned by a user belongs in ``.knowledge.yaml``
-(per-project closer-wins or ``$HOME/.knowledge.yaml`` as the laptop
+Anything that might be tuned by a user belongs in ``.knowledge-config.json``
+(per-project closer-wins or ``~/.knowledge/config.json`` as the laptop
 default — see :mod:`knowledge.settings`). This module only holds
 build-time constants that the chunker/embedder/scanner depend on; they
 shouldn't change at runtime.
@@ -22,10 +22,10 @@ EMBEDDING_DIM = 384
 # Chunk size threshold. Above this, split into big_parent + big_subchunks.
 MAX_CHARS = 1500
 
-# RAM cache budget (bytes). Overridable via .knowledge.yaml (cache_bytes key).
+# RAM cache budget (bytes). Overridable via .knowledge-config.json (cache_bytes key).
 CACHE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
-# Scan defaults. User-repo overrides live in .knowledge.yaml.
+# Scan defaults. User-repo overrides live in .knowledge-config.json.
 # Applied as a last-resort floor on top of .gitignore + .knowledgeignore
 # (so .git/ internals stay out even if the user unignores them by accident).
 # Gitignore syntax — pathspec GitWildMatchPattern interprets these.

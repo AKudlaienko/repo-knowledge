@@ -1,6 +1,6 @@
 # knowledge package
 
-Local semantic code search, dependency cartography, and session memory. Default storage is SQLite at `~/.knowledge/index.sqlite`; optional shared PostgreSQL via `.knowledge.yaml` (see root README).
+Local semantic code search, dependency cartography, and session memory. Default storage is SQLite at `~/.knowledge/index.sqlite`; optional shared PostgreSQL via `.knowledge-config.json` (see root README).
 
 **Entry point**: `knowledge.cli:main` (registered as `knowledge` console_script). All logic lives in this package.
 
@@ -10,9 +10,9 @@ Local semantic code search, dependency cartography, and session memory. Default 
 
 | Module | Purpose | Key symbols |
 |--------|---------|-------------|
-| `paths.py` | Filesystem locations (`~/.knowledge/`, overridable via `KNOWLEDGE_HOME`) | `user_dir`, `db_path`, `models_dir`, `config_path`, `stage_path` |
+| `paths.py` | Filesystem locations (`~/.knowledge/`, overridable via `KNOWLEDGE_HOME`) | `user_dir`, `db_path`, `models_dir`, `home_config_path`, `stage_dir` |
 | `config.py` | Hardcoded constants | `MODEL`, `EMBEDDING_DIM`, `MAX_CHARS`, `SCHEMA_VERSION`, `CHUNKER_VERSION`, `INCLUDE_GLOBS` |
-| `settings.py` | Load `.knowledge.yaml` (walk-up + `$HOME` fallback); resolve PG DSN from env | `load_settings`, `resolve_pg_dsn`, `Settings` |
+| `settings.py` | Load `.knowledge-config.json` (walk-up + `~/.knowledge/config.json` fallback); resolve PG DSN from env | `load_settings`, `resolve_pg_dsn`, `Settings` |
 | `db.py` | Connection factory + schema/meta helpers; delegates to active backend | `connect`, `init_schema`, `get_meta`, `set_meta` |
 | `backends/base.py` | Backend ABC (connect, transaction, advisory lock) | `Backend` |
 | `backends/sqlite.py` | Default laptop backend — APSW + sqlite-vec | `SqliteBackend` |
@@ -81,7 +81,7 @@ Prefer **`ask`** over **`search`** for agent use (hybrid + rerank + cache).
 - All `cmd_*` functions are command handlers dispatched from `cli.py`.
 - `CHANGE_ME` is the only sanitizer replacement token — consistent across both layers.
 - `config.SCHEMA_VERSION` + `config.CHUNKER_VERSION` in `meta`; mismatch → forced rebuild.
-- Storage mode resolution: `KNOWLEDGE_DATABASE_URL` → walk `.knowledge.yaml` → `$HOME/.knowledge.yaml` → SQLite default.
+- Storage mode resolution: `KNOWLEDGE_DATABASE_URL` → walk `.knowledge-config.json` → `~/.knowledge/config.json` → SQLite default.
 
 ## CLI entry point
 

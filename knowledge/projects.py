@@ -21,6 +21,7 @@ default which still commits on connection close.
 
 from __future__ import annotations
 
+import getpass
 import re
 import subprocess
 import time
@@ -91,6 +92,51 @@ def _git_remote(root: Path) -> str | None:
         return out.stdout.strip() or None if out.returncode == 0 else None
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
+
+
+def _git_config(root: Path, key: str) -> str | None:
+    """Best-effort ``git config --get <key>`` from ``root``; ``None`` if unset
+    or not a git repo."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "config", "--get", key],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def current_author(root: Path | None = None) -> str:
+    """Identity to stamp on a decision: git ``user.name <user.email>`` when
+    available, falling back to the UNIX login.
+
+    Resolution (first non-empty wins for each part):
+      * ``git config user.name`` / ``user.email`` scoped to ``root``
+      * ``"Name <email>"`` / ``"Name"`` / ``"<email>"`` as the parts allow
+      * UNIX login (``getpass.getuser()`` — reads $LOGNAME/$USER/passwd) when
+        there is no git identity (loose dir, or name+email both unset)
+
+    Never raises: shared-DB attribution must not be able to block a decide.
+    The UNIX-login fallback is also the natural last resort if getpass itself
+    can't resolve a name in some exotic environment.
+    """
+    r = root or current_project_root()
+    name = _git_config(r, "user.name")
+    email = _git_config(r, "user.email")
+    if name and email:
+        return f"{name} <{email}>"
+    if name:
+        return name
+    if email:
+        return f"<{email}>"
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
 
 
 # Match ssh-style git URLs like ``git@github.com:org/repo`` so we can
