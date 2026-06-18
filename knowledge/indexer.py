@@ -34,7 +34,7 @@ import json
 import time
 from pathlib import Path
 
-from . import config, db, query_cache, relations
+from . import ansible_vars, config, db, query_cache, relations, variables
 from .big_split import split_if_oversized
 from .chunkers import dispatch_chunker
 from .chunkers.base import Chunk
@@ -170,6 +170,11 @@ def build_project(
             vectors = embedder.encode(texts)
             for (cid, _), vec in zip(embed_queue, vectors):
                 db.insert_chunk_embedding(conn, cid, vec)
+
+        # Auto-discover ansible inventory variables before edges resolve,
+        # so templated paths (``{{ deploy_env }}/main.yml``) substitute
+        # against fresh values on the same pass.
+        _autoload_ansible_vars(conn, project.id, root, verbose)
 
         # Resolve + persist edges. Deferred to here so forward references
         # (A imports B, where A is walked before B) resolve against the
@@ -367,6 +372,14 @@ def update_project(
             for (cid, _), vec in zip(embed_queue, vectors):
                 db.insert_chunk_embedding(conn, cid, vec)
 
+        # Auto-discover ansible inventory variables before edges resolve.
+        # Even when no source files changed, an edited group_vars/all.yml
+        # should propagate — if there are no pending edges, we still
+        # re-resolve in place via apply_variables (cheap, idempotent).
+        autoload_changed = _autoload_ansible_vars(
+            conn, project.id, root, verbose
+        )
+
         # Flush edges after the whole walk so forward references resolve
         # against the final files table. Unchanged files keep their
         # existing edges untouched — no work done for them.
@@ -377,6 +390,10 @@ def update_project(
                     f"edges: {edge_count} across {len(pending_edges)} "
                     f"file(s) changed/added"
                 )
+        elif autoload_changed:
+            # No code changes, but YAML may have moved variable values —
+            # re-resolve any parametric edges against the new map.
+            variables.apply_variables(conn, project.id, root)
 
         db.execute(
             conn,
@@ -604,6 +621,47 @@ def _version_mismatches(conn: Connection) -> list[str]:
         if stored is not None and stored != v:
             out.append(k)
     return out
+
+
+def _autoload_ansible_vars(
+    conn: Connection,
+    project_id: int,
+    root: Path,
+    verbose: bool,
+) -> bool:
+    """Discover ``group_vars/all*`` + ``host_vars/*`` and upsert into
+    ``project_variables`` under ``scope='ansible'`` with auto sources.
+
+    Manual rows (``source='manual'``) are never overwritten — that
+    contract lives in :func:`variables.set_auto`. Stale auto rows whose
+    name is no longer present in the YAML are deleted.
+
+    Returns True if any auto rows were written or removed (used by the
+    update path to decide whether to re-resolve parametric edges when no
+    source files changed).
+    """
+
+    cfgs = relations._find_ansible_cfgs(root)
+    loaded = ansible_vars.load_inventory_vars(root, cfgs)
+    total_pairs = 0
+    for src, pairs in loaded.items():
+        source_label = f"auto:{src}"
+        # Both helpers run their own statements; the surrounding build/
+        # update transaction already wraps everything for atomicity.
+        variables.set_auto(
+            conn, project_id, "ansible", pairs, source=source_label
+        )
+        variables.delete_stale_auto(
+            conn, project_id, source_label, set(pairs.keys())
+        )
+        total_pairs += len(pairs)
+    if verbose and total_pairs:
+        files_seen = sum(1 for _, m in loaded.items() if m)
+        print(
+            f"ansible vars: loaded {total_pairs} entries from "
+            f"{files_seen} source(s) (group_vars/host_vars)"
+        )
+    return total_pairs > 0
 
 
 def _flush_edges(

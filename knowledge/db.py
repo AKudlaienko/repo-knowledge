@@ -191,6 +191,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         scope       TEXT    NOT NULL,
         name        TEXT    NOT NULL,
         value       TEXT    NOT NULL,
+        source      TEXT    NOT NULL DEFAULT 'manual',
         created_at  REAL    NOT NULL,
         updated_at  REAL    NOT NULL,
         UNIQUE(project_id, scope, name)
@@ -357,6 +358,17 @@ def init_schema(conn: Connection) -> None:
     ):
         if col not in have_cols:
             conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {decl}")
+
+    # Additive backfill for project_variables.source. Distinguishes manual
+    # `vars set` rows from auto-loaded ones (group_vars/host_vars). Default
+    # 'manual' keeps every pre-existing row's behavior intact.
+    have_cols = {row[1] for row in conn.execute(
+        "PRAGMA table_info(project_variables)")}
+    if "source" not in have_cols:
+        conn.execute(
+            "ALTER TABLE project_variables "
+            "ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'"
+        )
 
     # Seed versions on first run. APSW auto-commits outside of explicit
     # transaction blocks, so these INSERTs are durable immediately.
