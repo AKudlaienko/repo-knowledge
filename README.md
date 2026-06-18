@@ -18,6 +18,56 @@ Answers *meaning* questions — *"how does vault auth work?"*, *"where is the in
 - **🧠 Remembers every change without overwhelming context.** Decisions and a work-log persist across sessions; `knowledge resume` rehydrates the last decisions, touched files, and hub files in ~1200 tokens. Both humans and LLMs pick up exactly where they left off without re-reading the repo.
 - **🤝 Keeps a team in sync via one shared PostgreSQL.** Everyone shares a single index, history, and decision log. You see *why* a choice was made, and get a gated warning **before** feature A re-opens a problem feature B already solved — so dev B's work doesn't silently break the main logic or overrule a teammate's standard. And secrets stay safe: tokens, passwords, and keys are **sanitized to `CHANGE_ME` before anything is embedded or written to the shared DB**, so nothing sensitive ever lands in the team index.
 
+<details>
+<summary>🕸️ <strong>How the dependency graph works — and why it's better than a full graph tree</strong></summary>
+
+The relations graph is a **flat, file-granularity edge list**, not a materialized
+whole-repo tree. Edges flow through one pipeline:
+
+**language resolvers → `relations.py` → `file_edges` table**
+
+1. **Pure, per-language resolvers** (`knowledge/resolvers/`) parse each file with
+   tree-sitter and emit raw `Edge` objects — *"this file imports/includes that
+   specifier."* They know nothing about file IDs or project roots, so each language
+   (Python, JS/TS, Terraform, Helm, Ansible, Kustomize, GitHub Actions, ArgoCD) is an
+   independent resolver, not a branch of one shared schema.
+2. **`relations.py` resolves each edge to a target file.** It loads a `FileIndex` — an
+   in-memory snapshot of the project's `files` table (a `path → file_id` dict, ~1 query
+   + a comprehension) plus side-maps for variable / chart / role scoping — and fills in
+   `target_file_id` where it can.
+3. Each persisted edge is just `(source_file_id, target_file_id|NULL, kind, raw)`.
+
+Three invariants make it cheap and correct:
+
+- **Two-phase resolution** — resolvers run per-file during the walk, but resolution
+  waits until the whole file table exists, so forward references (A imports B before B
+  is indexed) still resolve.
+- **Wipe-before-insert** — re-indexing a file deletes only *its* outbound edges first.
+  Idempotent, incremental, no UNIQUE-constraint dance.
+- **`NULL target_file_id` is meaningful** — `kind='unresolved'` keeps the raw text of a
+  dynamic/templated reference; any other NULL-target edge is `external` (stdlib /
+  third-party). Partial knowledge is kept and labeled, never dropped.
+
+**Why this beats a materialized graph tree:**
+
+- **Incremental & cheap to update** — a changed file touches only its own edge rows; no
+  global tree to rebuild or invalidate on every edit (the post-edit `knowledge update`
+  hook depends on this).
+- **Resolution needs an index, not a tree** — every edge resolves in O(1) against a
+  throwaway dict; the whole graph is never held in memory at once.
+- **Queried lazily from SQL** — `knowledge relations <file>` is a `WHERE source=? /
+  target=?`; you traverse only the slice you ask for instead of front-loading edges you
+  may never read.
+- **Language-extensible** — adding a language is one pure resolver emitting `Edge`s, with
+  no unified node/edge type system to satisfy.
+
+The tradeoff is deliberate: it's a **file-level** graph (*file A depends on file B*), not
+symbol-level (*function `foo` calls `bar`*). Navigation, orientation, and blast-radius —
+the graph's actual job — are covered by file edges plus the separate symbol index
+(`knowledge find`), without paying for a repo-wide AST graph.
+
+</details>
+
 > 💻 **Platform & requirements:** developed and tested on **macOS (Apple Silicon)**. Should run on any Unix-like OS (Linux / WSL2) — it's pure Python + CPU PyTorch — but those are not yet verified, and Windows-native is untested. See [Requirements & platform ↓](#-details) for hardware guidance before you build.
 
 ---
