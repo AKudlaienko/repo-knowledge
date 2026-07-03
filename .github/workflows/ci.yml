@@ -1,10 +1,15 @@
 name: CI
 
-# Build-and-smoke CI: there is no test suite yet, so this verifies the thing
-# that actually breaks on changes — packaging. It builds the sdist + wheel,
-# validates the distribution metadata (catches the MIT license fields, missing
-# package-data, bad long-description), installs the wheel into a clean env, and
-# confirms the `knowledge` entry point imports and runs.
+# Two jobs:
+#  * build — every push/PR: builds the sdist + wheel, validates the
+#    distribution metadata (catches the MIT license fields, missing
+#    package-data, bad long-description), installs the wheel into a clean
+#    env, and confirms the `knowledge` entry point imports and runs.
+#  * test — pushes to main only (i.e. when a merge lands): runs the pytest
+#    suite. The Docker-backed shared-PG harness (`-m integration`) is
+#    deselected — CI runners have Docker, so without the filter a plain
+#    pytest run would launch the full 15-minute end-to-end scenario; it
+#    stays a local/manual tool (`pytest -m integration`).
 
 on:
   push:
@@ -54,3 +59,24 @@ jobs:
         with:
           name: dist
           path: dist/*
+
+  test:
+    # Runs only when a merge (push) lands on main — not on PRs or devel.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package with test + postgres extras
+        # postgres extra: several unit tests exercise the psycopg/pgvector
+        # code paths with mocks but import the real modules.
+        run: pip install -e '.[dev,postgres]'
+
+      - name: Run test suite
+        run: python -m pytest tests/ -m "not integration" -q
