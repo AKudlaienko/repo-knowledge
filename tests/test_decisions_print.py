@@ -14,8 +14,9 @@ import time
 
 import pytest
 
-from knowledge.cli import _print_decisions, _short_author, _truncate_words
+from knowledge.cli import _print_decisions, _print_resume, _short_author, _truncate_words
 from knowledge.decisions import Decision
+from knowledge.resume import ResumeBrief
 
 
 # ---------------------------------------------------------------------------
@@ -147,3 +148,51 @@ def test_print_decisions_full_no_blank_line_between_entries(capsys):
 def test_print_decisions_empty():
     # Should not raise; prints the "(no decisions)" placeholder.
     _print_decisions([])
+
+
+# ---------------------------------------------------------------------------
+# `[fact]` marker (Item H) — compact printer + resume, both kinds
+# ---------------------------------------------------------------------------
+
+def test_print_decisions_fact_marker_compact(capsys):
+    entries = [(_make_decision(kind="fact"), None)]
+    _print_decisions(entries)
+    out = capsys.readouterr().out
+    assert "topic:    [fact] test-topic" in out
+
+
+def test_print_decisions_fact_marker_full(capsys):
+    entries = [(_make_decision(kind="fact"), None)]
+    _print_decisions(entries, full=True)
+    out = capsys.readouterr().out
+    assert "topic:    [fact] test-topic" in out
+
+
+def test_print_decisions_plain_decision_no_marker(capsys):
+    entries = [(_make_decision(kind="decision"), None)]
+    _print_decisions(entries)
+    out = capsys.readouterr().out
+    assert "[fact]" not in out
+
+
+def test_print_resume_fact_marker():
+    fact = _make_decision(kind="fact", topic="pg-types-cache-stale-oid")
+    decision = _make_decision(kind="decision", topic="cache invalidation")
+    brief = ResumeBrief(
+        project_name="repo-knowledge",
+        project_root="/tmp/repo-knowledge",
+        last_decisions=[fact, decision],
+    )
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _print_resume(brief)
+    out = buf.getvalue()
+    assert "[fact] pg-types-cache-stale-oid" in out
+    assert "cache invalidation" in out
+    # The plain decision's line must NOT carry the marker.
+    for line in out.splitlines():
+        if "cache invalidation" in line:
+            assert "[fact]" not in line

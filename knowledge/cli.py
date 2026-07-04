@@ -179,16 +179,61 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_decide.add_argument("--project", help="Scope to a specific project (name or abs path)")
 
-    # decisions — list / search past decisions.
+    # fact — record a working fix / research finding. Thin wrapper over the
+    # decide plumbing: same store (decisions.kind='fact'), same author
+    # stamping / outbox buffering / supersede gating.
+    p_fact = sub.add_parser(
+        "fact",
+        help="Record a working fix / research finding (kind='fact' in the decisions store).",
+    )
+    p_fact.add_argument("topic", help="Short searchable label (e.g. 'pg-types-cache-stale-oid')")
+    p_fact.add_argument(
+        "--fact",
+        dest="fact_text",
+        required=True,
+        help="The finding/fix, stated as a reusable rule.",
+    )
+    p_fact.add_argument(
+        "--context",
+        help="The raw symptom (error text / failing behavior) — embedded "
+             "alongside topic+fact so a future semantic search by error text "
+             "hits this row.",
+    )
+    p_fact.add_argument("--why", dest="rationale", help="Evidence the fix/finding works.")
+    p_fact.add_argument(
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Files touched by this fact (optional)",
+    )
+    p_fact.add_argument("--session-id", help="Tag with session identifier")
+    p_fact.add_argument(
+        "--supersede",
+        type=int,
+        metavar="ID",
+        help="Override an existing decision/fact (its id). Requires --override-reason.",
+    )
+    p_fact.add_argument(
+        "--override-reason",
+        help="Why you are overriding the --supersede'd entry (required with it).",
+    )
+    p_fact.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # decisions — list / search past decisions (and facts).
     p_decs = sub.add_parser(
         "decisions",
-        help="List or search recorded decisions.",
+        help="List or search recorded decisions and facts.",
     )
     p_decs.add_argument("--topic", help="Case-insensitive substring filter on topic")
-    p_decs.add_argument("--search", dest="search_q", help="Semantic search over topic+decision")
+    p_decs.add_argument("--search", dest="search_q", help="Semantic search over topic+decision[+context]")
     p_decs.add_argument("--days", type=int, help="Only entries from the last N days")
     p_decs.add_argument("--limit", type=int, default=20)
     p_decs.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_decs.add_argument(
+        "--kind",
+        choices=("decision", "fact"),
+        help="Filter to just this kind (default: both).",
+    )
     p_decs.add_argument(
         "--format",
         choices=("text", "json"),
@@ -1042,13 +1087,20 @@ def _first_line(text: str, max_chars: int = 160) -> str:
 
 
 def cmd_decide(args: argparse.Namespace) -> int:
-    """Record a decision — Phase 4 session memory."""
+    """Record a decision (or, via ``cmd_fact``, a fact) — Phase 4 session
+    memory / Item H. ``kind``/``context`` default to a plain decision when
+    absent from ``args`` (the ``decide`` subparser doesn't define them —
+    only ``fact`` does), so this one function backs both CLI verbs."""
     from . import outbox
+
+    kind = getattr(args, "kind", "decision") or "decision"
+    context = getattr(args, "context", None)
 
     topic = args.topic.strip()
     decision = args.decision.strip()
     if not topic or not decision:
-        print("error: topic and --decision must be non-empty", file=sys.stderr)
+        label = "--fact" if kind == "fact" else "--decision"
+        print(f"error: topic and {label} must be non-empty", file=sys.stderr)
         return 2
 
     override_reason = (args.override_reason or "").strip() or None
@@ -1059,21 +1111,23 @@ def cmd_decide(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # `decide` should work even before a `build`; auto-create the project row
-    # the same way `history add` does. Author is stamped on every decision so
-    # shared-DB teammates can see who set each standard.
+    # `decide`/`fact` should work even before a `build`; auto-create the
+    # project row the same way `history add` does. Author is stamped on
+    # every row so shared-DB teammates can see who set each standard.
     root = projects.current_project_root()
     author = projects.current_author(root)
 
     try:
-        return _decide_online(args, root, author, topic, decision, override_reason)
+        return _decide_online(
+            args, root, author, topic, decision, override_reason, kind, context
+        )
     except db.offline_errors() as exc:
         # Shared DB unreachable — buffer locally instead of crashing. Enforce
         # the override gate without the DB (the comment requirement is policy,
         # not a lookup); the prior-decision detail just isn't available offline.
         if args.supersede is not None and not override_reason:
             print(
-                f"error: overriding decision id={args.supersede} requires "
+                f"error: overriding id={args.supersede} requires "
                 f'--override-reason "<why>" (shared DB offline — prior '
                 f"details unavailable).",
                 file=sys.stderr,
@@ -1091,22 +1145,29 @@ def cmd_decide(args: argparse.Namespace) -> int:
                 "author": author,
                 "supersedes": args.supersede,
                 "override_reason": override_reason if args.supersede else None,
+                "kind": kind,
+                "context": context,
             },
         )
+        noun = "fact" if kind == "fact" else "decision"
         print(
-            "note: shared DB unreachable — decision buffered locally; "
+            f"note: shared DB unreachable — {noun} buffered locally; "
             "will sync on the next reachable run."
         )
         return 0
 
 
-def _decide_online(args, root, author, topic, decision, override_reason) -> int:
-    """The DB-backed decide path. Raises ``db.offline_errors()`` if PG is
+def _decide_online(
+    args, root, author, topic, decision, override_reason, kind="decision", context=None
+) -> int:
+    """The DB-backed decide/fact path. Raises ``db.offline_errors()`` if PG is
     unreachable; ``cmd_decide`` catches that and buffers to the outbox."""
     from datetime import datetime
 
     from . import decisions as decisions_mod
     from . import outbox
+
+    noun = "fact" if kind == "fact" else "decision"
 
     with db.connect() as conn:
         outbox.drain(conn, root)  # push any backlog now that the DB is reachable
@@ -1133,10 +1194,10 @@ def _decide_online(args, root, author, topic, decision, override_reason) -> int:
                 ).strftime("%Y-%m-%d")
                 prior_by = target.author or "unknown"
                 print(
-                    f"⚠️  overriding decision id={target.id} "
+                    f"⚠️  overriding {target.kind} id={target.id} "
                     f"'{target.topic}' (set {prior_when} by {prior_by}).\n"
                     f"    decision: {target.decision}\n"
-                    f"error: overriding a prior decision requires "
+                    f"error: overriding a prior entry requires "
                     f'--override-reason "<why>" — teammates rely on it.',
                     file=sys.stderr,
                 )
@@ -1163,12 +1224,14 @@ def _decide_online(args, root, author, topic, decision, override_reason) -> int:
             author=author,
             supersedes=supersedes,
             override_reason=override_reason if supersedes else None,
+            kind=kind,
+            context=context,
         )
 
         if prior is not None:
             prior_by = f" by {prior.author}" if prior.author else ""
             print(
-                f"note: decision id={prior.id} already covers topic "
+                f"note: {prior.kind} id={prior.id} already covers topic "
                 f"'{topic}'{prior_by}; pass --supersede {prior.id} "
                 f"if you mean to override it.",
                 file=sys.stderr,
@@ -1176,10 +1239,20 @@ def _decide_online(args, root, author, topic, decision, override_reason) -> int:
 
     suffix = f" (supersedes id={supersedes})" if supersedes else ""
     print(
-        f"recorded decision id={new_id} by {author} in "
+        f"recorded {noun} id={new_id} by {author} in "
         f"'{proj.name}' ({proj.root_path}){suffix}"
     )
     return 0
+
+
+def cmd_fact(args: argparse.Namespace) -> int:
+    """Record a working fix / research finding — Item H. Thin wrapper over
+    ``cmd_decide``: same store (``decisions.kind='fact'``), same author
+    stamping / outbox buffering / supersede gating.
+    """
+    args.decision = args.fact_text
+    args.kind = "fact"
+    return cmd_decide(args)
 
 
 def cmd_decisions(args: argparse.Namespace) -> int:
@@ -1196,6 +1269,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
                 query=args.search_q,
                 project_id=proj.id,
                 top_k=args.limit,
+                kind=args.kind,
             )
             entries = [(d, dist) for d, dist in raw]
         else:
@@ -1205,6 +1279,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
                 days=args.days,
                 topic=args.topic,
                 limit=args.limit,
+                kind=args.kind,
             )
             # Pair with None distance so the formatter handles both paths uniformly.
             entries = [(d, None) for d in plain]
@@ -1300,8 +1375,9 @@ def _print_decisions(entries, full: bool = False) -> None:
         when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d %H:%M")
         dist_s = f"  dist={dist:.3f}" if dist is not None else ""
         by = f"  by {author_s}" if author_s else ""
+        marker = "[fact] " if d.kind == "fact" else ""
         print(f"{when}  id={d.id}{by}{dist_s}")
-        print(f"  topic:    {d.topic}")
+        print(f"  topic:    {marker}{d.topic}")
         print(f"  decision: {decision_s}")
         if rationale_s:
             print(f"  why:      {rationale_s}")
@@ -1331,7 +1407,8 @@ def _print_resume(rb) -> None:
             when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d")
             by = f"  ({d.author})" if d.author else ""
             ovr = f"  [overrides id={d.supersedes}]" if d.supersedes else ""
-            print(f"  {when}  {d.topic}{by}{ovr}")
+            marker = "[fact] " if d.kind == "fact" else ""
+            print(f"  {when}  {marker}{d.topic}{by}{ovr}")
             print(f"            → {d.decision}")
 
     # 2. Touched files
@@ -3460,6 +3537,7 @@ _DISPATCH = {
     "map": cmd_map,
     "brief": cmd_brief,
     "decide": cmd_decide,
+    "fact": cmd_fact,
     "decisions": cmd_decisions,
     "resume": cmd_resume,
     "consolidate": cmd_consolidate,

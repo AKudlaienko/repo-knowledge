@@ -55,7 +55,14 @@ def test_strip_frontmatter_is_idempotent(skill_text: str) -> None:
 # Compact AGENTS.md render (todo/tasks/todo.md Item D)
 # ---------------------------------------------------------------------------
 
-_MAX_COMPACT_BYTES = 8 * 1024  # ~2k tokens
+# Bumped 8192 -> 8448 for Item H (decision id=195 had already flagged the
+# render at 8072/8192, almost no headroom). The Item H spec requires two
+# short additions to whitelisted sections (a `knowledge fact` trigger line in
+# Session memory + a one-line mention in the conflict check) that push the
+# render to 8410 bytes; trimming further would cut load-bearing prose rather
+# than incidental padding, so the budget itself moves per the spec's explicit
+# "if genuinely impossible, bump to 8448" fallback.
+_MAX_COMPACT_BYTES = 8448  # ~2k tokens + Item H fact-verb mentions
 
 
 def test_render_agents_is_compact_by_default(skill_text: str) -> None:

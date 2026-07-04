@@ -443,6 +443,16 @@ knowledge consolidate     # read-only audit: recurring history themes not yet re
 
 Every decision is stamped with its author (git identity, UNIX-login fallback). Overriding an existing decision needs `--supersede <id> --override-reason "<why>"` — the tool blocks until you justify it, so in shared mode teammates relying on the old behavior aren't silently overruled.
 
+**`knowledge fact`** records a working fix or research finding — the third thing session memory needs alongside "decisions" (choices) and "history" (narrative). It's the same store as `decide` (one additive `kind` column, no new table): `--fact` is the reusable rule, `--context` is the raw symptom/error text so a future session searching by that literal error hits this row, `--why` is the evidence it works. `decisions --search` covers both kinds by default (facts are exactly the prior-fight context the pre-change conflict check exists to surface); `resume` and the compact printer mark facts with `[fact]`; filter either with `--kind fact`.
+
+```bash
+knowledge fact "pg-types-cache-stale-oid" \
+  --fact "delete ~/.knowledge/pg_types_cache.json after DROP/CREATE EXTENSION vector; connect(refresh_types=True) rewrites it" \
+  --context 'psycopg.errors.UndefinedObject: type "vector" does not exist' \
+  --why "OID cache held typeids from before the extension was dropped/recreated; a fresh fetch+rewrite fixed the connect() crash" \
+  --files knowledge/backends/postgres.py
+```
+
 **Consolidate** (`knowledge consolidate`) is a **read-only** audit that closes the gap between the two stores: it semantically clusters recurring `history` themes and flags any *not yet captured as a `decision`*, printing a ready-to-fill `decide` scaffold for each. It never writes — you review the candidates and record the real ones. Themes already covered by an existing decision are skipped, so a clean run means your decision log is keeping pace with your work. Scans the last 90 days by default (`--days`); tune `--similarity` / `--covered` to widen or tighten.
 
 Use `ask` for code questions, not history search.

@@ -16,7 +16,7 @@ These four rules apply on every invocation. They exist because they reduce tool-
 
 ## Pre-change conflict check (MANDATORY)
 
-Before drafting a plan, before writing/editing any file, and before each major step within a multi-step plan, query the index for prior decisions and incidents on the same topic. Sessions are weeks apart; the user will not remember every prior fight, and neither will you. The index does.
+Before drafting a plan, before writing/editing any file, and before each major step within a multi-step plan, query the index for prior decisions and incidents on the same topic. Sessions are weeks apart; the user will not remember every prior fight, and neither will you. The index does — including `knowledge fact` entries (working fixes), not just `decide` choices.
 
 **Required queries (run in parallel when possible):**
 
@@ -111,6 +111,8 @@ knowledge resume
 ```
 
 Four blocks in order: last 5 decisions, 10 most-touched files (7d), un-ingested stage entries, top 3 hub files. ~1200 tokens, idempotent. Run first on every new session.
+
+Found a working fix for a non-obvious problem, or a research result worth keeping? → `knowledge fact "<topic>" --fact "<finding>" --context "<symptom>"` — same store as `decide` (`kind=fact`), searchable by symptom text, shown with a `[fact]` marker.
 
 ## Rules / gotchas
 
