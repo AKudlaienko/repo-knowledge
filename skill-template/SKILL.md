@@ -87,6 +87,8 @@ Branch on `state`:
 - `stale`   → `knowledge update` (usually <5s; only re-embeds chunks whose sanitized text changed).
 - `fresh`   → go straight to your query verb.
 
+Embedding verbs auto-use a warm-model daemon (20-min idle exit; `knowledge daemon status|stop`; disable via `KNOWLEDGE_NO_DAEMON=1`). Daemon failures fall back in-process — never an error to handle.
+
 ## Storage routing — where does my data live?
 
 The skill talks to whichever backend the current cwd resolves to. Resolution order:

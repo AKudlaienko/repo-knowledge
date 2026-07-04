@@ -96,21 +96,36 @@ def _search_sqlite(
     """
     params.append(top_k)
     rows = conn.execute(sql, params).fetchall()
-    return [_row_to_result(r) for r in rows]
+    return [row_to_result(r) for r in rows]
 
 
-def _search_postgres(
-    conn: Connection,
+def build_pg_vector_query(
     q_vec,
     project_id: int | None,
     kind: str | None,
     lang: str | None,
     top_k: int,
-) -> list[SearchResult]:
-    # pgvector accepts numpy arrays directly when ``register_vector`` was
-    # called on the connection (see PostgresBackend.connect). The cosine
-    # distance operator is ``<=>`` and matches our L2-normalized
-    # embeddings — same metric as sqlite-vec's default.
+) -> tuple[str, list]:
+    """Pure builder for the pgvector KNN query. No DB access — callable to
+    prepare a statement for either a direct ``cur.execute`` or a pipelined
+    ``conn.execute`` (see ``hybrid_search._pg_pipelined_channels``).
+
+    pgvector accepts numpy arrays directly when ``register_vector`` was
+    called on the connection (see ``PostgresBackend.connect``). The cosine
+    distance operator is ``<=>`` and matches our L2-normalized
+    embeddings — same metric as sqlite-vec's default.
+
+    **Param shape is decision id=102 and must not change**: SQL placeholder
+    order is distance projection, filter clauses, ORDER BY operand, LIMIT.
+    ``q_vec`` appears twice (once for the projected distance column, once
+    for the ORDER BY operator) with the filters sandwiched *between* the
+    two occurrences — so the param list must be built as
+    ``[q_vec, *filter_params, q_vec, top_k]`` from a separate,
+    initially-empty ``filter_params`` list. Pre-seeding a list with
+    ``q_vec`` and prepending it again silently doubles ``q_vec`` at the
+    front and breaks the param/placeholder count (this exact bug was
+    caught live against production PG — see decision id=102).
+    """
     where_clauses: list[str] = []
     filter_params: list = []
     if project_id is not None:
@@ -137,18 +152,36 @@ def _search_postgres(
         ORDER BY e.embedding <=> %s
         LIMIT %s
     """
-    # SQL placeholder order: distance projection, filter clauses, ORDER BY
-    # operand, LIMIT. q_vec appears twice (once for the projected distance
-    # column, once for the ORDER BY operator) so pgvector can evaluate
-    # them independently without materializing the join.
     params = [q_vec, *filter_params, q_vec, top_k]
+    return sql, params
+
+
+def _search_postgres(
+    conn: Connection,
+    q_vec,
+    project_id: int | None,
+    kind: str | None,
+    lang: str | None,
+    top_k: int,
+) -> list[SearchResult]:
+    sql, params = build_pg_vector_query(q_vec, project_id, kind, lang, top_k)
     with conn.cursor() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
-    return [_row_to_result(r) for r in rows]
+    return rows_to_results(rows)
 
 
-def _row_to_result(r) -> SearchResult:
+def rows_to_results(rows) -> list[SearchResult]:
+    """Convert raw pgvector-query rows into ``SearchResult``.
+
+    Exposed (not private) so ``hybrid_search`` can convert rows fetched
+    from a pipelined ``conn.execute`` the same way ``_search_postgres``
+    converts rows from a plain cursor.
+    """
+    return [row_to_result(r) for r in rows]
+
+
+def row_to_result(r) -> SearchResult:
     return SearchResult(
         chunk_id=r[0],
         kind=r[1],

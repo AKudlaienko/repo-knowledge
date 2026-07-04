@@ -241,6 +241,32 @@ Each `build` registers a new project in the shared DB. A chunker/model version b
 </details>
 
 <details>
+<summary>🔥 <strong>Embedder daemon (warm model)</strong></summary>
+
+Every embedding-backed command normally pays ~2.3s of torch import + model load in a throwaway process. The embedder daemon keeps one warm model resident in a small background process (Unix socket, spawned automatically on first use), so repeat `ask`/`search`/`decide` calls skip that cost. **On by default**; it exits on its own after **20 minutes idle** and can never break a command — any daemon failure silently falls back to the in-process embedder.
+
+```bash
+knowledge daemon status   # running/not + pid, model, idle seconds (exit 0/1)
+knowledge daemon stop     # ask it to exit (exit 0 even if not running)
+knowledge daemon run      # foreground server — what the auto-spawn launches
+```
+
+Disable it either way (env wins):
+
+```jsonc
+// .knowledge-config.json or ~/.knowledge/config.json
+{ "daemon": { "enabled": false, "idle_timeout_seconds": 1200 } }
+```
+
+```bash
+KNOWLEDGE_NO_DAEMON=1 knowledge ask "..."   # per-invocation / CI escape hatch
+```
+
+Log lives at `~/.knowledge/daemon/daemon.log`; the socket at `~/.knowledge/daemon/embed.sock` (dir enforced `0700`, socket `0600`). A stale daemon left over from a package upgrade or an `embedding_model` change is detected via a version/model handshake and respawned automatically.
+
+</details>
+
+<details>
 <summary>🔍 <strong>Search & cartography</strong></summary>
 
 ```bash

@@ -607,6 +607,30 @@ def main(argv: list[str] | None = None) -> int:
              "and print the plan; do not write to PG",
     )
 
+    # daemon — warm-embedder background process (Item F). Spawned on demand
+    # by embedder.get_embedder(); these verbs exist for manual control/triage.
+    p_daemon = sub.add_parser(
+        "daemon",
+        help="Warm-embedder daemon: keeps the model loaded between commands "
+             "(on by default; disable via config daemon.enabled=false or "
+             "KNOWLEDGE_NO_DAEMON=1)",
+    )
+    p_daemon_sub = p_daemon.add_subparsers(dest="daemon_cmd", required=True)
+    p_daemon_sub.add_parser(
+        "run",
+        help="Run the daemon in the foreground (this is what the automatic "
+             "spawn launches; log at ~/.knowledge/daemon/daemon.log)",
+    )
+    p_daemon_sub.add_parser(
+        "status",
+        help="Report running/not + pid, model, idle seconds "
+             "(exit 0 running, 1 not)",
+    )
+    p_daemon_sub.add_parser(
+        "stop",
+        help="Ask a running daemon to exit (exit 0 even if none is running)",
+    )
+
     # install-hooks
     p_hooks = sub.add_parser(
         "install-hooks",
@@ -3453,6 +3477,7 @@ _DISPATCH = {
     "skill": lambda args: _SKILL_DISPATCH[args.skill_cmd](args),
     "config": lambda args: _CONFIG_DISPATCH[args.config_cmd](args),
     "db": lambda args: _DB_DISPATCH[args.db_cmd](args),
+    "daemon": lambda args: _DAEMON_DISPATCH[args.daemon_cmd](args),
 }
 
 
@@ -3907,6 +3932,81 @@ _DB_DISPATCH = {
     "ping": cmd_db_ping,
     "init-postgres": cmd_db_init_postgres,
     "migrate": cmd_db_migrate,
+}
+
+
+# ---------------------------------------------------------------------------
+# daemon subcommands (Item F — warm-embedder daemon)
+# ---------------------------------------------------------------------------
+
+
+def cmd_daemon_run(args: argparse.Namespace) -> int:
+    """Foreground server loop — the process the automatic spawn launches.
+
+    Always hosts the LOCAL embedder (``daemon.run_server`` builds its own
+    ``Embedder``; it never calls ``embedder.get_embedder()``), so the
+    daemon can't recurse into spawning itself. Exits on its own after
+    ``daemon.idle_timeout_seconds`` without requests, or on ``daemon stop``.
+    """
+    del args  # no flags — idle timeout comes from the config block
+    import logging
+
+    from . import daemon as daemon_mod
+
+    # The spawn path redirects our stdout/stderr to daemon.log; make the
+    # server's logging visible there (and on the terminal for manual runs).
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    daemon_mod.run_server()
+    return 0
+
+
+def cmd_daemon_status(args: argparse.Namespace) -> int:
+    """Report whether a daemon is serving. Exit 0 = running, 1 = not."""
+    del args
+    from . import daemon as daemon_mod
+
+    client = daemon_mod.DaemonEmbedder()
+    try:
+        info = client.ping()
+    except daemon_mod.DaemonUnavailable:
+        print("daemon: not running")
+        print(f"  socket: {paths.daemon_socket_path()}")
+        return 1
+
+    idle_s = max(0.0, time.time() - float(info.get("last_used", time.time())))
+    print("daemon: running")
+    print(f"  pid:     {info.get('pid')}")
+    print(f"  model:   {info.get('model')}")
+    print(f"  version: {info.get('version')}")
+    print(f"  idle:    {idle_s:.0f}s")
+    print(f"  socket:  {paths.daemon_socket_path()}")
+    return 0
+
+
+def cmd_daemon_stop(args: argparse.Namespace) -> int:
+    """Send the ``shutdown`` op. Exit 0 even when no daemon is running —
+    "make sure it's not running" is an idempotent request."""
+    del args
+    from . import daemon as daemon_mod
+
+    client = daemon_mod.DaemonEmbedder()
+    try:
+        info = client.ping()
+    except daemon_mod.DaemonUnavailable:
+        print("daemon: not running")
+        return 0
+    client.shutdown()
+    print(f"daemon: stopped (pid {info.get('pid')})")
+    return 0
+
+
+_DAEMON_DISPATCH = {
+    "run": cmd_daemon_run,
+    "status": cmd_daemon_status,
+    "stop": cmd_daemon_stop,
 }
 
 

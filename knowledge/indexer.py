@@ -40,7 +40,7 @@ from .big_split import split_if_oversized
 from .chunkers import dispatch_chunker
 from .chunkers.base import Chunk
 from .db import Connection
-from .embedder import get_embedder
+from .embedder import get_local_embedder
 from .projects import get_or_create_project, update_counts
 from .resolvers import Edge
 from .sanitizer import scrub_text
@@ -108,7 +108,7 @@ def build_project(
         if embed_queue:
             if verbose:
                 print(f"embedding {len(embed_queue)} chunks...", flush=True)
-            embedder = get_embedder()
+            embedder = get_local_embedder()
             texts = [t for (_, t) in embed_queue]
             vectors = embedder.encode(texts)
             db.insert_chunk_embeddings_bulk(
@@ -382,7 +382,7 @@ def update_project(
         if embed_queue:
             if verbose:
                 print(f"embedding {len(embed_queue)} chunks...", flush=True)
-            embedder = get_embedder()
+            embedder = get_local_embedder()
             texts = [t for (_, t) in embed_queue]
             vectors = embedder.encode(texts)
             db.insert_chunk_embeddings_bulk(

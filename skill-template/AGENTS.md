@@ -71,6 +71,8 @@ Branch on `state`:
 - `stale`   → `knowledge update` (usually <5s; only re-embeds chunks whose sanitized text changed).
 - `fresh`   → go straight to your query verb.
 
+Embedding verbs auto-use a warm-model daemon (20-min idle exit; `knowledge daemon status|stop`; disable via `KNOWLEDGE_NO_DAEMON=1`). Daemon failures fall back in-process — never an error to handle.
+
 ## Session memory — `decide` + `resume`
 
 See the priority directives above. Full detail:
