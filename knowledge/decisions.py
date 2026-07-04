@@ -11,6 +11,10 @@ Schema (see :mod:`knowledge.db`):
 * ``rationale``    — one-line why (optional)
 * ``files_touched``— JSON array of rel_paths (optional)
 * ``session_id``   — whichever Claude session recorded it (optional)
+* ``kind``         — ``"decision"`` (default) or ``"fact"``. A fact is a
+  working fix / research finding recorded via ``knowledge fact`` — same row
+  shape, same embedding index, no separate table (Item H). Retrieval treats
+  both kinds identically unless the caller passes ``kind=`` to filter.
 
 Mirrors the add/get/recent/search API shape from :mod:`history` so the
 CLI dispatcher stays boringly similar.
@@ -40,11 +44,12 @@ class Decision(NamedTuple):
     author: str | None            # who recorded it (git identity / UNIX login)
     supersedes: int | None        # id of the decision this one overrides
     override_reason: str | None   # justification comment for the override
+    kind: str = "decision"        # "decision" (default) or "fact"
 
 
 _SELECT_COLS = (
     "id, project_id, created_at, topic, decision, rationale, "
-    "files_touched, session_id, author, supersedes, override_reason"
+    "files_touched, session_id, author, supersedes, override_reason, kind"
 )
 
 
@@ -59,25 +64,52 @@ def add(
     author: str | None = None,
     supersedes: int | None = None,
     override_reason: str | None = None,
+    kind: str = "decision",
+    context: str | None = None,
 ) -> int:
-    """Insert one decision + its embedding. Returns new row id.
+    """Insert one decision (or fact) + its embedding. Returns new row id.
 
     Embedded text is ``topic || ' :: ' || decision`` — both fields matter
     for retrieval, and the separator keeps tokenization from bleeding
-    one into the other.
+    one into the other. When ``context`` is given (the ``knowledge fact``
+    path — a symptom / error string), it is appended as a third segment
+    (``topic :: decision :: context``) so a future session searching by the
+    literal error text still hits this row.
+
+    ``context`` is not a separate column — it is folded into ``rationale``
+    with a label (``"Symptom: ...\\n\\nWhy it works: ..."``) so a fact stays a
+    plain decisions row (Item H: no new table). ``rationale`` alone (no
+    context — the plain ``decide`` path) is stored verbatim, unchanged from
+    before this parameter existed.
 
     ``author`` is stamped on every decision for shared-DB attribution.
     ``supersedes`` / ``override_reason`` are set together only when this
     decision overrides a prior one (the CLI enforces the justification).
+    ``kind`` is ``"decision"`` (default) or ``"fact"``.
     """
     # Scrub secrets from all free-text fields before embedding and storage.
     # topic is usually a short slug but can carry leaked values from user
-    # shell history; rationale is optional prose — both are scrubbed cheaply.
+    # shell history; rationale/context are optional prose — all are scrubbed
+    # cheaply before either storage or embedding sees them.
     topic = scrub_text(topic)
     decision = scrub_text(decision)
     if rationale is not None:
         rationale = scrub_text(rationale)
-    text_to_embed = f"{topic} :: {decision}"
+    if context is not None:
+        context = scrub_text(context)
+
+    if context:
+        # Fold context into rationale with labels so the fact stays a plain
+        # decisions row — dense and self-explanatory without a new column.
+        parts = [f"Symptom: {context}"]
+        if rationale:
+            parts.append(f"Why it works: {rationale}")
+        stored_rationale = "\n\n".join(parts)
+        text_to_embed = f"{topic} :: {decision} :: {context}"
+    else:
+        stored_rationale = rationale
+        text_to_embed = f"{topic} :: {decision}"
+
     vec = get_embedder().encode([text_to_embed])[0]
     files_json = json.dumps(files_touched) if files_touched else None
 
@@ -87,10 +119,11 @@ def add(
             conn,
             "INSERT INTO decisions("
             "project_id, created_at, topic, decision, rationale, "
-            "files_touched, session_id, author, supersedes, override_reason) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (project_id, now, topic, decision, rationale, files_json,
-             session_id, author, supersedes, override_reason),
+            "files_touched, session_id, author, supersedes, override_reason, "
+            "kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (project_id, now, topic, decision, stored_rationale, files_json,
+             session_id, author, supersedes, override_reason, kind),
         )
         db.insert_decision_embedding(conn, new_id, vec)
     return new_id
@@ -134,11 +167,14 @@ def recent(
     days: int | None = None,
     topic: str | None = None,
     limit: int = 20,
+    kind: str | None = None,
 ) -> list[Decision]:
     """Newest-first list; no vector work.
 
     ``topic`` filter is case-insensitive LIKE — a coarse prefix/substring
-    filter for the common "show me decisions about cache" flow.
+    filter for the common "show me decisions about cache" flow. ``kind``
+    (``"decision"`` or ``"fact"``) filters to just that kind; ``None``
+    (default) returns both — the mandated conflict check must see facts too.
     """
     where: list[str] = []
     params: list = []
@@ -157,6 +193,9 @@ def recent(
         else:
             where.append("topic LIKE ? COLLATE NOCASE")
         params.append(f"%{topic}%")
+    if kind:
+        where.append("kind = ?")
+        params.append(kind)
 
     extra = ("WHERE " + " AND ".join(where)) if where else ""
     params.append(limit)
@@ -174,9 +213,14 @@ def search(
     query: str,
     project_id: int | None = None,
     top_k: int = config.DEFAULT_TOP_K,
+    kind: str | None = None,
 ) -> list[tuple[Decision, float]]:
-    """Semantic search over ``topic || decision``. ``(decision, distance)``
-    ordered by ascending distance.
+    """Semantic search over ``topic || decision [|| context]``. ``(decision,
+    distance)`` ordered by ascending distance.
+
+    ``kind`` (``"decision"`` or ``"fact"``) filters to just that kind;
+    ``None`` (default) returns both — the mandated conflict check must see
+    facts too.
     """
     q_vec = get_embedder().encode([query])[0]
     k_fetch = top_k * 3 if project_id is not None else top_k
@@ -188,6 +232,9 @@ def search(
         if project_id is not None:
             where_clauses.append("d.project_id = %s")
             filter_params.append(project_id)
+        if kind:
+            where_clauses.append("d.kind = %s")
+            filter_params.append(kind)
         extra_where = (
             "AND " + " AND ".join(where_clauses) if where_clauses else ""
         )
@@ -213,6 +260,9 @@ def search(
     if project_id is not None:
         where_clauses.append("d.project_id = ?")
         params.append(project_id)
+    if kind:
+        where_clauses.append("d.kind = ?")
+        params.append(kind)
     extra_where = ("AND " + " AND ".join(where_clauses)) if where_clauses else ""
     sql = f"""
         SELECT {cols_prefixed}, v.distance
@@ -256,4 +306,5 @@ def _row_to_decision(row) -> Decision:
         author=row[8],
         supersedes=row[9],
         override_reason=row[10],
+        kind=row[11] if len(row) > 11 and row[11] else "decision",
     )

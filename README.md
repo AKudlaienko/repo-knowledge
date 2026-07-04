@@ -19,6 +19,145 @@ Answers *meaning* questions — *"how does vault auth work?"*, *"where is the in
 - **🤝 Keeps a team in sync via one shared PostgreSQL.** Everyone shares a single index, history, and decision log. You see *why* a choice was made, and get a gated warning **before** feature A re-opens a problem feature B already solved — so dev B's work doesn't silently break the main logic or overrule a teammate's standard. And secrets stay safe: tokens, passwords, and keys are **sanitized to `CHANGE_ME` before anything is embedded or written to the shared DB**, so nothing sensitive ever lands in the team index.
 
 <details>
+<summary>❓<strong>WHY</strong></summary>
+
+## 🤔 The problem, in one story
+
+Imagine a company archive room with **50,000 documents**. Now imagine that every
+time anyone has a question — *"why do we ship on Tuesdays?"* — the intern answering
+it has to **read the entire archive from scratch**. Every question. Every day.
+And at the end of each day, the intern's memory is wiped.
+
+That is, almost literally, how AI coding assistants work with a big project today:
+
+- They **re-read huge chunks of the project** for every question — slow and,
+  because AI pricing is *pay-per-word*, expensive.
+- They **forget everything between sessions** — yesterday's hard-won conclusions
+  are gone this morning.
+- Different people's AI assistants **can't see each other's findings** — the same
+  problem gets re-solved (and re-broken) by different teammates.
+
+**repo-knowledge is the fix: it gives your project a librarian and a logbook.**
+
+---
+
+## 📚 What it actually does — three jobs
+
+### 1. The Librarian *(find things fast)*
+
+A librarian doesn't read every book each time you ask a question. They cataloged
+the library **once**, so they can walk straight to the right shelf and hand you
+**the exact page** you need.
+
+repo-knowledge reads your whole project once, builds a catalog (an "index"), and
+after that answers questions like *"how does login work?"* by returning just the
+few relevant paragraphs — not the whole archive.
+
+**Why it matters:** your AI assistant reads 20 lines instead of 20,000. Answers
+arrive in a fraction of a second, and the pay-per-word AI bill shrinks accordingly.
+
+### 2. The Map *(see how things connect)*
+
+Projects are like cities: touching one street affects the traffic on five others.
+repo-knowledge maintains a **road map of connections** — which parts of the
+project depend on which — so before anyone changes something, they can ask
+*"what else does this affect?"* and get a real answer instead of a guess.
+
+**Why it matters:** fewer "we changed X and accidentally broke Y" surprises.
+
+### 3. The Logbook *(never lose a decision)*
+
+Ships keep a logbook so the night crew knows what the day crew decided, and why.
+repo-knowledge keeps two:
+
+- **Decisions** — *"we chose approach A over B, here's why, signed, dated."*
+- **Work history** — *"here's what we actually did this week."*
+
+Every entry is stamped with **who** wrote it and **when**. And here's the special
+part: if someone later tries to reverse a recorded decision, the tool **stops and
+asks them to explain why** before letting them — so nobody silently undoes a
+teammate's carefully-reasoned choice.
+
+**Why it matters:** the answer to *"why is it built this way?!"* stops being
+*"the person who knew left the company."*
+
+---
+
+## 🚀 Benefits
+
+You use AI tools (Claude, Cursor, Codex, Gemini) to build things. repo-knowledge
+plugs into **all of them** and quietly makes them:
+- **Faster** — answers come from the catalog, not from re-reading everything.
+- **Cheaper** — dramatically fewer words sent to the AI = smaller bill.
+- **Smarter across days** — your assistant *remembers* what you decided last week
+  and warns you before you accidentally undo it.
+
+You don't manage anything. It sets itself up, keeps its catalog fresh on its own,
+and stays out of the way.
+
+### Team mode
+By default everyone has their own private librarian. Flip one switch and the team
+shares **one common brain** (a shared database): one catalog, one decision log,
+one work history. Developer A's assistant knows what developer B decided
+yesterday — before A re-opens the problem B already solved.
+
+---
+
+## 🔒 "Is my code safe?" — the two rules
+
+1. **Private by default.** Everything lives in a file *on your computer*. Nothing
+   is uploaded anywhere. (The shared team mode is opt-in, and it's *your* server.)
+2. **Secrets never enter the catalog.** Before anything is stored, the tool
+   scrubs passwords, keys, and tokens and replaces them with the placeholder
+   `CHANGE_ME`. Like a document archivist who blacks out account numbers before
+   filing a copy — the original is untouched; the *catalog* never contains the
+   sensitive part.
+
+---
+
+## ⚡ Why it's fast
+
+- **Catalog once, answer forever.** The heavy work (reading everything) happens
+  once. After that, only *changed* pages get re-cataloged — automatically.
+- **Remember recent answers.** Ask the same question twice, get the second answer
+  from a sticky note instead of a fresh search. The sticky notes self-expire the
+  moment anything relevant changes, so they're never stale.
+- **Keep the engine running.** The "understanding" machinery (an AI model that
+  turns text into meaning) used to be started from cold for every single
+  question — like boiling the kettle from scratch for each cup of tea. Now a
+  small helper keeps the kettle warm in the background and switches itself off
+  after 20 idle minutes. Result: questions that took ~2.5 seconds now take ~0.2.
+
+None of this needs your attention. If any convenience layer fails, the tool
+quietly falls back to the slow-but-safe way — it never breaks, it just
+occasionally makes you wait like it's 2024 again.
+
+---
+
+## 🧩 The one-line summary
+
+> **repo-knowledge turns a codebase from a pile of documents into a library with
+> a librarian, a road map, and a logbook — so both humans and AI assistants stop
+> re-reading, stop re-deciding, and stop re-breaking things.**
+
+---
+
+## 📌 Common questions
+
+**Does it change my code?**
+Never. It only *reads* your project and keeps its own notes on the side.
+
+**What if I stop using it?**
+Delete one folder and it's gone. Your project is untouched — it was only ever
+the librarian's card catalog, never the books.
+
+**What does it cost to run?**
+It runs on your own machine, offline, no subscription. The savings show up on
+your AI bill — because your assistant reads pages instead of archives.
+
+</details>
+
+<details>
 <summary>🗺️ <strong>How it works (at a glance)</strong></summary>
 
 ```mermaid
@@ -54,56 +193,6 @@ flowchart TB
 
 </details>
 
-<details>
-<summary>🕸️ <strong>How the dependency graph works — and why it's better than a full graph tree</strong></summary>
-
-The relations graph is a **flat, file-granularity edge list**, not a materialized
-whole-repo tree. Edges flow through one pipeline:
-
-**language resolvers → `relations.py` → `file_edges` table**
-
-1. **Pure, per-language resolvers** (`knowledge/resolvers/`) parse each file with
-   tree-sitter and emit raw `Edge` objects — *"this file imports/includes that
-   specifier."* They know nothing about file IDs or project roots, so each language
-   (Python, JS/TS, Terraform, Helm, Ansible, Kustomize, GitHub Actions, ArgoCD) is an
-   independent resolver, not a branch of one shared schema.
-2. **`relations.py` resolves each edge to a target file.** It loads a `FileIndex` — an
-   in-memory snapshot of the project's `files` table (a `path → file_id` dict, ~1 query
-   + a comprehension) plus side-maps for variable / chart / role scoping — and fills in
-   `target_file_id` where it can.
-3. Each persisted edge is just `(source_file_id, target_file_id|NULL, kind, raw)`.
-
-Three invariants make it cheap and correct:
-
-- **Two-phase resolution** — resolvers run per-file during the walk, but resolution
-  waits until the whole file table exists, so forward references (A imports B before B
-  is indexed) still resolve.
-- **Wipe-before-insert** — re-indexing a file deletes only *its* outbound edges first.
-  Idempotent, incremental, no UNIQUE-constraint dance.
-- **`NULL target_file_id` is meaningful** — `kind='unresolved'` keeps the raw text of a
-  dynamic/templated reference; any other NULL-target edge is `external` (stdlib /
-  third-party). Partial knowledge is kept and labeled, never dropped.
-
-**Why this beats a materialized graph tree:**
-
-- **Incremental & cheap to update** — a changed file touches only its own edge rows; no
-  global tree to rebuild or invalidate on every edit (the post-edit `knowledge update`
-  hook depends on this).
-- **Resolution needs an index, not a tree** — every edge resolves in O(1) against a
-  throwaway dict; the whole graph is never held in memory at once.
-- **Queried lazily from SQL** — `knowledge relations <file>` is a `WHERE source=? /
-  target=?`; you traverse only the slice you ask for instead of front-loading edges you
-  may never read.
-- **Language-extensible** — adding a language is one pure resolver emitting `Edge`s, with
-  no unified node/edge type system to satisfy.
-
-The tradeoff is deliberate: it's a **file-level** graph (*file A depends on file B*), not
-symbol-level (*function `foo` calls `bar`*). Navigation, orientation, and blast-radius —
-the graph's actual job — are covered by file edges plus the separate symbol index
-(`knowledge find`), without paying for a repo-wide AST graph.
-
-</details>
-
 > 💻 **Platform & requirements:** developed and tested on **macOS (Apple Silicon)**. Should run on any Unix-like OS (Linux / WSL2) — it's pure Python + CPU PyTorch — but those are not yet verified, and Windows-native is untested. See [Requirements & platform ↓](#-details) for hardware guidance before you build.
 
 ---
@@ -128,7 +217,7 @@ pip install -e .
 pip install -e '.[postgres]'
 ```
 
-> 🤖 **Using an AI coding agent?** Run `knowledge install-skill --ide all` to wire the skill into Claude Code, Cursor, Codex, and OpenCode — auto-build, auto-update, agent-first verbs.
+> 🤖 **Using an AI coding agent?** Run `knowledge install-skill --ide all` to wire the skill into Claude Code, Cursor, Codex, OpenCode, and Gemini — auto-build, auto-update, agent-first verbs.
 
 
 # Index any repo (first run downloads a ~130 MB embedding model)
@@ -148,7 +237,7 @@ knowledge ask "how does X work?"
 | 🎯 **Find** | `knowledge find <symbol>` · `grep '<pattern>'` | Exact symbol / full-text lookup (no embedder) |
 | 🧭 **Orient** | `knowledge why <file>` · `map` · `brief` | Understand a file or tree before reading it |
 | 🕸️ **Graph** | `knowledge relations <file>` · `graph` | Imports, callers, blast radius |
-| 🧠 **Remember** | `knowledge resume` · `decide` · `history` | Decisions + work log across sessions |
+| 🧠 **Remember** | `knowledge resume` · `decide` · `history` · `consolidate` | Decisions + work log across sessions |
 | 🔄 **Maintain** | `knowledge update` · `status --json` | Keep the index fresh (`missing`/`stale`/`fresh`) |
 
 > 💡 **Sharpen retrieval** by prefixing queries with a *kind hint*: `python function:`, `terraform resource:`, `ansible task:`, `helm template:`, `docs:`. → [full table in Details ↓](#-details)
@@ -241,6 +330,32 @@ Each `build` registers a new project in the shared DB. A chunker/model version b
 </details>
 
 <details>
+<summary>🔥 <strong>Embedder daemon (warm model)</strong></summary>
+
+Every embedding-backed command normally pays ~2.3s of torch import + model load in a throwaway process. The embedder daemon keeps one warm model resident in a small background process (Unix socket, spawned automatically on first use), so repeat `ask`/`search`/`decide` calls skip that cost. **On by default**; it exits on its own after **20 minutes idle** and can never break a command — any daemon failure silently falls back to the in-process embedder.
+
+```bash
+knowledge daemon status   # running/not + pid, model, idle seconds (exit 0/1)
+knowledge daemon stop     # ask it to exit (exit 0 even if not running)
+knowledge daemon run      # foreground server — what the auto-spawn launches
+```
+
+Disable it either way (env wins):
+
+```jsonc
+// .knowledge-config.json or ~/.knowledge/config.json
+{ "daemon": { "enabled": false, "idle_timeout_seconds": 1200 } }
+```
+
+```bash
+KNOWLEDGE_NO_DAEMON=1 knowledge ask "..."   # per-invocation / CI escape hatch
+```
+
+Log lives at `~/.knowledge/daemon/daemon.log`; the socket at `~/.knowledge/daemon/embed.sock` (dir enforced `0700`, socket `0600`). A stale daemon left over from a package upgrade or an `embedding_model` change is detected via a version/model handshake and respawned automatically.
+
+</details>
+
+<details>
 <summary>🔍 <strong>Search & cartography</strong></summary>
 
 ```bash
@@ -322,16 +437,30 @@ knowledge history stage --short "Fixed project-name resolution." --long "…" --
 knowledge history ingest
 knowledge history recent --limit 10
 knowledge history search "auth middleware"
+
+knowledge consolidate     # read-only audit: recurring history themes not yet recorded as a decision
 ```
 
 Every decision is stamped with its author (git identity, UNIX-login fallback). Overriding an existing decision needs `--supersede <id> --override-reason "<why>"` — the tool blocks until you justify it, so in shared mode teammates relying on the old behavior aren't silently overruled.
+
+**`knowledge fact`** records a working fix or research finding — the third thing session memory needs alongside "decisions" (choices) and "history" (narrative). It's the same store as `decide` (one additive `kind` column, no new table): `--fact` is the reusable rule, `--context` is the raw symptom/error text so a future session searching by that literal error hits this row, `--why` is the evidence it works. `decisions --search` covers both kinds by default (facts are exactly the prior-fight context the pre-change conflict check exists to surface); `resume` and the compact printer mark facts with `[fact]`; filter either with `--kind fact`.
+
+```bash
+knowledge fact "pg-types-cache-stale-oid" \
+  --fact "delete ~/.knowledge/pg_types_cache.json after DROP/CREATE EXTENSION vector; connect(refresh_types=True) rewrites it" \
+  --context 'psycopg.errors.UndefinedObject: type "vector" does not exist' \
+  --why "OID cache held typeids from before the extension was dropped/recreated; a fresh fetch+rewrite fixed the connect() crash" \
+  --files knowledge/backends/postgres.py
+```
+
+**Consolidate** (`knowledge consolidate`) is a **read-only** audit that closes the gap between the two stores: it semantically clusters recurring `history` themes and flags any *not yet captured as a `decision`*, printing a ready-to-fill `decide` scaffold for each. It never writes — you review the candidates and record the real ones. Themes already covered by an existing decision are skipped, so a clean run means your decision log is keeping pace with your work. Scans the last 90 days by default (`--days`); tune `--similarity` / `--covered` to widen or tighten.
 
 Use `ask` for code questions, not history search.
 
 </details>
 
 <details>
-<summary>🤖 <strong>Agent / IDE integration (Claude Code, Cursor, Codex, OpenCode)</strong></summary>
+<summary>🤖 <strong>Agent / IDE integration (Claude Code, Cursor, Codex, OpenCode, Gemini)</strong></summary>
 
 The `knowledge` CLI is tool-agnostic — any agent that can run a shell uses it the same way. `install-skill` wires the *instruction file* into the location each tool discovers, all generated from one source (`skill-template/SKILL.md`):
 
@@ -339,7 +468,8 @@ The `knowledge` CLI is tool-agnostic — any agent that can run a shell uses it 
 knowledge install-skill                          # default → Claude Code (.claude/skills/knowledge/SKILL.md)
 knowledge install-skill --ide cursor             # → .cursor/rules/knowledge.mdc
 knowledge install-skill --ide codex,opencode     # → ./AGENTS.md  (shared; written once)
-knowledge install-skill --ide all                # all four at once
+knowledge install-skill --ide gemini             # → ./GEMINI.md
+knowledge install-skill --ide all                # all five at once
 knowledge install-skill --ide all --user         # user/global location per tool
 knowledge install-skill --ide claude --symlink   # auto-updates on git pull here
 knowledge install-skill --ide cursor --force     # overwrite an existing dedicated file
@@ -351,8 +481,13 @@ knowledge install-skill --ide cursor --force     # overwrite an existing dedicat
 | `cursor` | `.cursor/rules/knowledge.mdc` | *(project only)* |
 | `codex` | `AGENTS.md` | `~/.codex/AGENTS.md` |
 | `opencode` | `AGENTS.md` | `~/.config/opencode/AGENTS.md` |
+| `gemini` | `GEMINI.md` | `~/.gemini/GEMINI.md` |
 
-`codex` and `opencode` (and Cursor as a fallback) all read the same root **`AGENTS.md`** — it's written once and merged into a `<!-- BEGIN/END knowledge skill -->` block, so any content you already keep there is preserved. Dedicated files (`SKILL.md`, `.mdc`) need `--force` to overwrite. Cursor's `.mdc` is an *agent-requested* rule by default (`alwaysApply: false`); pass `--always-apply` to attach it to every request.
+`codex`, `opencode`, and `gemini` (and Cursor as a fallback) all read a root instruction file — `AGENTS.md` for the first two, `GEMINI.md` for Gemini — written once and merged into a `<!-- BEGIN/END knowledge skill -->` block, so any content you already keep there is preserved (no `--force` needed; re-installs just replace the block). Dedicated files (`SKILL.md`, `.mdc`) do need `--force` to overwrite. Cursor's `.mdc` is an *agent-requested* rule by default (`alwaysApply: false`); pass `--always-apply` to attach it to every request.
+
+`codex`/`opencode`/`gemini` get a **compact** instruction block (~8KB, priority directives + intent→verb table + auto-maintenance + decide/resume essentials + a short conflict-check + gotchas) — their instructions are injected into every session unconditionally, so the full ~32KB guide would be always-on token overhead. Any agent stuck with the compact form can pull the complete guide on demand with `knowledge skill show`. Cursor's `.mdc` stays the FULL guide since it's only pulled in when the agent judges it relevant.
+
+gemini-cli also supports a `contextFileName` setting that can point at `AGENTS.md` instead of `GEMINI.md`, if you'd rather not maintain a separate file for it.
 
 > 🔧 Maintainers: `AGENTS.md` and `knowledge.mdc` are generated from `SKILL.md` — run `make sync-skill` after editing it (CI guards drift via `tests/test_skill_sync.py`).
 

@@ -23,7 +23,7 @@ These four rules apply on every invocation. They exist because they reduce tool-
 
 ## Pre-change conflict check (MANDATORY)
 
-Before drafting a plan, before writing/editing any file, and before each major step within a multi-step plan, query the index for prior decisions and incidents on the same topic. Sessions are weeks apart; the user will not remember every prior fight, and neither will you. The index does.
+Before drafting a plan, before writing/editing any file, and before each major step within a multi-step plan, query the index for prior decisions and incidents on the same topic. Sessions are weeks apart; the user will not remember every prior fight, and neither will you. The index does — including `knowledge fact` entries (working fixes), not just `decide` choices.
 
 **Required queries (run in parallel when possible):**
 
@@ -86,6 +86,8 @@ Branch on `state`:
 - `missing` → `knowledge build` (first-time: 1–5 min for embedding model + initial encode; warn the user).
 - `stale`   → `knowledge update` (usually <5s; only re-embeds chunks whose sanitized text changed).
 - `fresh`   → go straight to your query verb.
+
+Embedding verbs auto-use a warm-model daemon (20-min idle exit; `knowledge daemon status|stop`; disable via `KNOWLEDGE_NO_DAEMON=1`). Daemon failures fall back in-process — never an error to handle.
 
 ## Storage routing — where does my data live?
 
@@ -227,6 +229,8 @@ knowledge resume
 
 Four blocks in order: last 5 decisions, 10 most-touched files (7d), un-ingested stage entries, top 3 hub files. ~1200 tokens, idempotent. Run first on every new session.
 
+Found a working fix for a non-obvious problem, or a research result worth keeping? → `knowledge fact "<topic>" --fact "<finding>" --context "<symptom>"` — same store as `decide` (`kind=fact`), searchable by symptom text, shown with a `[fact]` marker.
+
 ## `search` — raw-chunks flow (legacy / specialist use)
 
 Kept for when you need ranked vector results without RRF/rerank/cache — e.g. comparing distances, piping to downstream code, or debugging retrieval.
@@ -313,6 +317,7 @@ User: "how does the karmada cert regeneration ansible task work"
 Two complementary stores:
 - **History** (`knowledge history stage|ingest|recent|search`) — free-form work summaries keyed by session/time. Good for "what did we do last Tuesday."
 - **Decisions** (`knowledge decide|decisions|resume`) — structured choices with topic/decision/rationale/files. Good for "why did we pick X over Y."
+- **Consolidate** (`knowledge consolidate`) — read-only report of recurring `history` themes not yet captured as a `decision`. Run periodically (end of a work stretch, or every few weeks) or when `resume` shows many history entries but few decisions. It never writes — review the candidates and record the real ones with `decide`.
 
 Use **history** for narrative, **decisions** for commitments. `resume` aggregates both plus git and staging state into one session-start brief.
 

@@ -13,6 +13,13 @@ The module-level ``Embedder`` instance is a lazy singleton: the model is
 loaded on the first ``encode`` call, then reused. Re-instantiating the
 class repeatedly is safe — the underlying model is cached per-instance,
 but callers should use ``get_embedder()`` to share the loaded model.
+
+Embedder daemon (Item F): ``get_embedder()`` prefers a warm background
+daemon (:mod:`knowledge.daemon`) over the in-process model when the daemon
+is enabled (config ``daemon.enabled``, default true; ``KNOWLEDGE_NO_DAEMON=1``
+env wins) and reachable-or-spawnable. Callers see the exact same
+``.encode(texts) -> np.float32`` surface either way; every daemon failure
+mode falls back to this module's local path silently.
 """
 
 from __future__ import annotations
@@ -22,6 +29,14 @@ import numpy as np
 from . import config, paths
 
 _DEFAULT: "Embedder | None" = None
+
+# Daemon-vs-local decision, made once per process. The positive case caches
+# the connected DaemonEmbedder (so we don't re-ping per get_embedder call);
+# the negative case caches the None (so a failed spawn's ~2s retry budget is
+# paid at most once per process, not once per encode site). Tests reset both
+# via monkeypatch.
+_DAEMON_DECIDED: bool = False
+_DAEMON_CLIENT = None  # daemon.DaemonEmbedder | None
 
 
 class Embedder:
@@ -109,9 +124,54 @@ class Embedder:
         return embs.astype(np.float32)
 
 
-def get_embedder() -> Embedder:
-    """Shared singleton so repeated ``build``/``search`` calls reuse the model."""
+def _local_embedder() -> Embedder:
+    """The in-process lazy singleton — the pre-daemon behavior, untouched.
+
+    Also the fallback target for :class:`knowledge.daemon.DaemonEmbedder`
+    when the daemon dies between the ``get_embedder()`` handshake and an
+    actual ``encode`` call.
+    """
     global _DEFAULT
     if _DEFAULT is None:
         _DEFAULT = Embedder()
     return _DEFAULT
+
+
+def get_local_embedder() -> Embedder:
+    """In-process embedder for bulk / long-running callers (the indexer).
+
+    ``build``/``update`` embed whole-repo batches: routing thousands of
+    texts through the daemon socket would serialize megabytes of JSON and
+    monopolize the daemon's serial accept loop, blocking every interactive
+    ``ask`` on the machine behind a minutes-long encode — while the ~2.5s
+    model load the daemon exists to avoid is noise over a build's runtime.
+    Interactive verbs keep using :func:`get_embedder`.
+    """
+    return _local_embedder()
+
+
+def get_embedder():
+    """Shared embedder for search/decisions/history/consolidate.
+
+    Returns a :class:`knowledge.daemon.DaemonEmbedder` proxy (same
+    ``.encode`` surface) when the embedder daemon is enabled and its socket
+    is usable or spawnable; otherwise the ordinary in-process
+    :class:`Embedder` singleton. The daemon decision never raises and never
+    imports torch — the local path keeps its lazy-load semantics untouched.
+
+    ``knowledge daemon run`` itself does NOT go through here (its server
+    constructs a local :class:`Embedder` directly), so there is no way for
+    the daemon to recurse into spawning itself.
+    """
+    global _DAEMON_DECIDED, _DAEMON_CLIENT
+    if not _DAEMON_DECIDED:
+        _DAEMON_DECIDED = True
+        try:
+            from . import daemon as daemon_mod
+
+            _DAEMON_CLIENT = daemon_mod.get_daemon_embedder()
+        except Exception:  # noqa: BLE001 — daemon must never break a command
+            _DAEMON_CLIENT = None
+    if _DAEMON_CLIENT is not None:
+        return _DAEMON_CLIENT
+    return _local_embedder()

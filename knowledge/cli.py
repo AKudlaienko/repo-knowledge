@@ -179,20 +179,70 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_decide.add_argument("--project", help="Scope to a specific project (name or abs path)")
 
-    # decisions — list / search past decisions.
+    # fact — record a working fix / research finding. Thin wrapper over the
+    # decide plumbing: same store (decisions.kind='fact'), same author
+    # stamping / outbox buffering / supersede gating.
+    p_fact = sub.add_parser(
+        "fact",
+        help="Record a working fix / research finding (kind='fact' in the decisions store).",
+    )
+    p_fact.add_argument("topic", help="Short searchable label (e.g. 'pg-types-cache-stale-oid')")
+    p_fact.add_argument(
+        "--fact",
+        dest="fact_text",
+        required=True,
+        help="The finding/fix, stated as a reusable rule.",
+    )
+    p_fact.add_argument(
+        "--context",
+        help="The raw symptom (error text / failing behavior) — embedded "
+             "alongside topic+fact so a future semantic search by error text "
+             "hits this row.",
+    )
+    p_fact.add_argument("--why", dest="rationale", help="Evidence the fix/finding works.")
+    p_fact.add_argument(
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Files touched by this fact (optional)",
+    )
+    p_fact.add_argument("--session-id", help="Tag with session identifier")
+    p_fact.add_argument(
+        "--supersede",
+        type=int,
+        metavar="ID",
+        help="Override an existing decision/fact (its id). Requires --override-reason.",
+    )
+    p_fact.add_argument(
+        "--override-reason",
+        help="Why you are overriding the --supersede'd entry (required with it).",
+    )
+    p_fact.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # decisions — list / search past decisions (and facts).
     p_decs = sub.add_parser(
         "decisions",
-        help="List or search recorded decisions.",
+        help="List or search recorded decisions and facts.",
     )
     p_decs.add_argument("--topic", help="Case-insensitive substring filter on topic")
-    p_decs.add_argument("--search", dest="search_q", help="Semantic search over topic+decision")
+    p_decs.add_argument("--search", dest="search_q", help="Semantic search over topic+decision[+context]")
     p_decs.add_argument("--days", type=int, help="Only entries from the last N days")
     p_decs.add_argument("--limit", type=int, default=20)
     p_decs.add_argument("--project", help="Scope to a specific project (name or abs path)")
     p_decs.add_argument(
+        "--kind",
+        choices=("decision", "fact"),
+        help="Filter to just this kind (default: both).",
+    )
+    p_decs.add_argument(
         "--format",
         choices=("text", "json"),
         default="text",
+    )
+    p_decs.add_argument(
+        "--full",
+        action="store_true",
+        help="Print untruncated decision/why text (default: compact, ~200/120 char truncation).",
     )
 
     # resume — opinionated session-start brief.
@@ -201,6 +251,28 @@ def main(argv: list[str] | None = None) -> int:
         help='"Where did I leave off?" — decisions + touched files + pending stage + hubs.',
     )
     p_resume.add_argument("--project", help="Scope to a specific project (name or abs path)")
+
+    # consolidate — recurring-theme gap report (read-only).
+    p_consol = sub.add_parser(
+        "consolidate",
+        help="Surface recurring history themes not yet recorded as decisions (read-only).",
+    )
+    p_consol.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_consol.add_argument("--days", type=int, default=90,
+                          help="History window in days (default: 90)")
+    p_consol.add_argument("--limit", type=int, default=100,
+                          help="Max history entries to scan (default: 100)")
+    p_consol.add_argument("--similarity", type=float, default=0.55,
+                          help="Cluster similarity threshold (default: 0.55)")
+    p_consol.add_argument("--covered", type=float, default=0.68,
+                          help="Coverage threshold against decisions (default: 0.68)")
+    p_consol.add_argument("--min-cluster", type=int, default=2, dest="min_cluster",
+                          help="Minimum cluster size (default: 2)")
+    p_consol.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+    )
 
     # get
     p_get = sub.add_parser("get", help="Fetch a chunk by id")
@@ -453,14 +525,18 @@ def main(argv: list[str] | None = None) -> int:
     # install-skill
     p_install = sub.add_parser(
         "install-skill",
-        help="Wire the knowledge skill into one or more IDEs (Claude/Cursor/Codex/OpenCode)",
+        help="Wire the knowledge skill into one or more IDEs (Claude/Cursor/Codex/OpenCode/Gemini)",
     )
     p_install.add_argument(
         "--ide",
         default="claude",
         help=(
-            "Comma-separated target IDEs: claude,cursor,codex,opencode (or 'all'). "
-            "Default: claude — .claude/skills/knowledge/SKILL.md"
+            "Comma-separated target IDEs: claude,cursor,codex,opencode,gemini "
+            "(or 'all' for all five). Default: claude — "
+            ".claude/skills/knowledge/SKILL.md. codex/opencode/gemini get the "
+            "COMPACT AGENTS-style render (see `knowledge skill show` for the "
+            "full guide); cursor's .mdc stays full (agent-requested, not "
+            "always-on)."
         ),
     )
     p_install.add_argument(
@@ -482,6 +558,19 @@ def main(argv: list[str] | None = None) -> int:
         "--force",
         action="store_true",
         help="Overwrite an existing dedicated skill file (SKILL.md / .mdc) at the target",
+    )
+
+    # skill — progressive-disclosure escape hatch: the compact AGENTS.md /
+    # GEMINI.md renders end with "Full guide: run `knowledge skill show`" so
+    # any IDE stuck with the compact form can pull the complete guide on demand.
+    p_skill = sub.add_parser(
+        "skill",
+        help="Inspect the canonical knowledge skill content",
+    )
+    p_skill_sub = p_skill.add_subparsers(dest="skill_cmd", required=True)
+    p_skill_sub.add_parser(
+        "show",
+        help="Print the full canonical skill body (frontmatter stripped)",
     )
 
     # config — runtime settings (storage mode, PG DSN status). Phase 0 of
@@ -561,6 +650,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run pre-flight checks (resolve, model match, conflict, counts) "
              "and print the plan; do not write to PG",
+    )
+
+    # daemon — warm-embedder background process (Item F). Spawned on demand
+    # by embedder.get_embedder(); these verbs exist for manual control/triage.
+    p_daemon = sub.add_parser(
+        "daemon",
+        help="Warm-embedder daemon: keeps the model loaded between commands "
+             "(on by default; disable via config daemon.enabled=false or "
+             "KNOWLEDGE_NO_DAEMON=1)",
+    )
+    p_daemon_sub = p_daemon.add_subparsers(dest="daemon_cmd", required=True)
+    p_daemon_sub.add_parser(
+        "run",
+        help="Run the daemon in the foreground (this is what the automatic "
+             "spawn launches; log at ~/.knowledge/daemon/daemon.log)",
+    )
+    p_daemon_sub.add_parser(
+        "status",
+        help="Report running/not + pid, model, idle seconds "
+             "(exit 0 running, 1 not)",
+    )
+    p_daemon_sub.add_parser(
+        "stop",
+        help="Ask a running daemon to exit (exit 0 even if none is running)",
     )
 
     # install-hooks
@@ -974,13 +1087,20 @@ def _first_line(text: str, max_chars: int = 160) -> str:
 
 
 def cmd_decide(args: argparse.Namespace) -> int:
-    """Record a decision — Phase 4 session memory."""
+    """Record a decision (or, via ``cmd_fact``, a fact) — Phase 4 session
+    memory / Item H. ``kind``/``context`` default to a plain decision when
+    absent from ``args`` (the ``decide`` subparser doesn't define them —
+    only ``fact`` does), so this one function backs both CLI verbs."""
     from . import outbox
+
+    kind = getattr(args, "kind", "decision") or "decision"
+    context = getattr(args, "context", None)
 
     topic = args.topic.strip()
     decision = args.decision.strip()
     if not topic or not decision:
-        print("error: topic and --decision must be non-empty", file=sys.stderr)
+        label = "--fact" if kind == "fact" else "--decision"
+        print(f"error: topic and {label} must be non-empty", file=sys.stderr)
         return 2
 
     override_reason = (args.override_reason or "").strip() or None
@@ -991,21 +1111,23 @@ def cmd_decide(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # `decide` should work even before a `build`; auto-create the project row
-    # the same way `history add` does. Author is stamped on every decision so
-    # shared-DB teammates can see who set each standard.
+    # `decide`/`fact` should work even before a `build`; auto-create the
+    # project row the same way `history add` does. Author is stamped on
+    # every row so shared-DB teammates can see who set each standard.
     root = projects.current_project_root()
     author = projects.current_author(root)
 
     try:
-        return _decide_online(args, root, author, topic, decision, override_reason)
+        return _decide_online(
+            args, root, author, topic, decision, override_reason, kind, context
+        )
     except db.offline_errors() as exc:
         # Shared DB unreachable — buffer locally instead of crashing. Enforce
         # the override gate without the DB (the comment requirement is policy,
         # not a lookup); the prior-decision detail just isn't available offline.
         if args.supersede is not None and not override_reason:
             print(
-                f"error: overriding decision id={args.supersede} requires "
+                f"error: overriding id={args.supersede} requires "
                 f'--override-reason "<why>" (shared DB offline — prior '
                 f"details unavailable).",
                 file=sys.stderr,
@@ -1023,22 +1145,29 @@ def cmd_decide(args: argparse.Namespace) -> int:
                 "author": author,
                 "supersedes": args.supersede,
                 "override_reason": override_reason if args.supersede else None,
+                "kind": kind,
+                "context": context,
             },
         )
+        noun = "fact" if kind == "fact" else "decision"
         print(
-            "note: shared DB unreachable — decision buffered locally; "
+            f"note: shared DB unreachable — {noun} buffered locally; "
             "will sync on the next reachable run."
         )
         return 0
 
 
-def _decide_online(args, root, author, topic, decision, override_reason) -> int:
-    """The DB-backed decide path. Raises ``db.offline_errors()`` if PG is
+def _decide_online(
+    args, root, author, topic, decision, override_reason, kind="decision", context=None
+) -> int:
+    """The DB-backed decide/fact path. Raises ``db.offline_errors()`` if PG is
     unreachable; ``cmd_decide`` catches that and buffers to the outbox."""
     from datetime import datetime
 
     from . import decisions as decisions_mod
     from . import outbox
+
+    noun = "fact" if kind == "fact" else "decision"
 
     with db.connect() as conn:
         outbox.drain(conn, root)  # push any backlog now that the DB is reachable
@@ -1065,10 +1194,10 @@ def _decide_online(args, root, author, topic, decision, override_reason) -> int:
                 ).strftime("%Y-%m-%d")
                 prior_by = target.author or "unknown"
                 print(
-                    f"⚠️  overriding decision id={target.id} "
+                    f"⚠️  overriding {target.kind} id={target.id} "
                     f"'{target.topic}' (set {prior_when} by {prior_by}).\n"
                     f"    decision: {target.decision}\n"
-                    f"error: overriding a prior decision requires "
+                    f"error: overriding a prior entry requires "
                     f'--override-reason "<why>" — teammates rely on it.',
                     file=sys.stderr,
                 )
@@ -1095,12 +1224,14 @@ def _decide_online(args, root, author, topic, decision, override_reason) -> int:
             author=author,
             supersedes=supersedes,
             override_reason=override_reason if supersedes else None,
+            kind=kind,
+            context=context,
         )
 
         if prior is not None:
             prior_by = f" by {prior.author}" if prior.author else ""
             print(
-                f"note: decision id={prior.id} already covers topic "
+                f"note: {prior.kind} id={prior.id} already covers topic "
                 f"'{topic}'{prior_by}; pass --supersede {prior.id} "
                 f"if you mean to override it.",
                 file=sys.stderr,
@@ -1108,10 +1239,20 @@ def _decide_online(args, root, author, topic, decision, override_reason) -> int:
 
     suffix = f" (supersedes id={supersedes})" if supersedes else ""
     print(
-        f"recorded decision id={new_id} by {author} in "
+        f"recorded {noun} id={new_id} by {author} in "
         f"'{proj.name}' ({proj.root_path}){suffix}"
     )
     return 0
+
+
+def cmd_fact(args: argparse.Namespace) -> int:
+    """Record a working fix / research finding — Item H. Thin wrapper over
+    ``cmd_decide``: same store (``decisions.kind='fact'``), same author
+    stamping / outbox buffering / supersede gating.
+    """
+    args.decision = args.fact_text
+    args.kind = "fact"
+    return cmd_decide(args)
 
 
 def cmd_decisions(args: argparse.Namespace) -> int:
@@ -1128,6 +1269,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
                 query=args.search_q,
                 project_id=proj.id,
                 top_k=args.limit,
+                kind=args.kind,
             )
             entries = [(d, dist) for d, dist in raw]
         else:
@@ -1137,6 +1279,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
                 days=args.days,
                 topic=args.topic,
                 limit=args.limit,
+                kind=args.kind,
             )
             # Pair with None distance so the formatter handles both paths uniformly.
             entries = [(d, None) for d in plain]
@@ -1151,7 +1294,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             default=str,
         ))
     else:
-        _print_decisions(entries)
+        _print_decisions(entries, full=args.full)
     return 0
 
 
@@ -1173,22 +1316,71 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_decisions(entries) -> None:
-    """Pretty-print (Decision, distance|None) tuples."""
+def _truncate_words(text, limit: int) -> str:
+    """Cut ``text`` at the last word boundary at-or-before ``limit`` chars.
+
+    Appends '…' only when truncation actually happened. Text at or under the
+    limit is returned unchanged. ``None``/empty input passes through as-is.
+    """
+    if not text:
+        return text
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    last_space = cut.rfind(" ")
+    if last_space > 0:
+        cut = cut[:last_space]
+    return cut.rstrip() + "…"
+
+
+def _short_author(author):
+    """Drop the '<email>' portion of a 'Name <email>' author string.
+
+    Leaves bare emails (no name part) or plain names/logins untouched —
+    there is nothing shorter to fall back to in those cases.
+    """
+    if not author:
+        return author
+    import re
+
+    m = re.match(r"^(.+?)\s*<[^>]*>$", author)
+    if m and m.group(1):
+        return m.group(1)
+    return author
+
+
+def _print_decisions(entries, full: bool = False) -> None:
+    """Pretty-print (Decision, distance|None) tuples.
+
+    Compact by default (~200-char decision / ~120-char why, short author) to
+    keep the mandated pre-change conflict check cheap for LLM agents; pass
+    ``full=True`` (CLI: --full) for the verbatim text and full author string.
+    """
     from datetime import datetime
 
     if not entries:
         print("(no decisions)")
         return
-    for d, dist in entries:
+    for i, (d, dist) in enumerate(entries):
+        if full:
+            author_s = d.author
+            decision_s = d.decision
+            rationale_s = d.rationale
+        else:
+            if i > 0:
+                print()
+            author_s = _short_author(d.author)
+            decision_s = _truncate_words(d.decision, 200)
+            rationale_s = _truncate_words(d.rationale, 120)
         when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d %H:%M")
         dist_s = f"  dist={dist:.3f}" if dist is not None else ""
-        by = f"  by {d.author}" if d.author else ""
+        by = f"  by {author_s}" if author_s else ""
+        marker = "[fact] " if d.kind == "fact" else ""
         print(f"{when}  id={d.id}{by}{dist_s}")
-        print(f"  topic:    {d.topic}")
-        print(f"  decision: {d.decision}")
-        if d.rationale:
-            print(f"  why:      {d.rationale}")
+        print(f"  topic:    {marker}{d.topic}")
+        print(f"  decision: {decision_s}")
+        if rationale_s:
+            print(f"  why:      {rationale_s}")
         if d.supersedes:
             ovr = f" — {d.override_reason}" if d.override_reason else ""
             print(f"  overrides: id={d.supersedes}{ovr}")
@@ -1215,7 +1407,8 @@ def _print_resume(rb) -> None:
             when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d")
             by = f"  ({d.author})" if d.author else ""
             ovr = f"  [overrides id={d.supersedes}]" if d.supersedes else ""
-            print(f"  {when}  {d.topic}{by}{ovr}")
+            marker = "[fact] " if d.kind == "fact" else ""
+            print(f"  {when}  {marker}{d.topic}{by}{ovr}")
             print(f"            → {d.decision}")
 
     # 2. Touched files
@@ -1248,6 +1441,135 @@ def _print_resume(rb) -> None:
     )
 
 
+def cmd_consolidate(args: argparse.Namespace) -> int:
+    """Recurring-theme gap report — read-only consolidation of history vs decisions."""
+    import json as json_mod
+    from . import consolidate as consolidate_mod
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        report = consolidate_mod.build(
+            conn,
+            project_id=proj.id,
+            project_name=proj.name,
+            project_root=str(proj.root_path),
+            days=args.days,
+            limit=args.limit,
+            sim_threshold=args.similarity,
+            covered_threshold=args.covered,
+            min_size=args.min_cluster,
+        )
+
+    if args.format == "json":
+        def _serialise(report) -> dict:
+            return {
+                "project_name": report.project_name,
+                "project_root": report.project_root,
+                "scanned_history_n": report.scanned_history_n,
+                "total_decisions": report.total_decisions,
+                "covered_skipped_n": report.covered_skipped_n,
+                "singletons_n": report.singletons_n,
+                "candidates": [
+                    {
+                        "suggested_topic": c.suggested_topic,
+                        "entry_ids": [e.id for e in c.entries],
+                        "entry_shorts": [e.short_summary for e in c.entries],
+                        "files": c.files,
+                        "nearest_decision_id": (
+                            c.nearest_decision.id if c.nearest_decision else None
+                        ),
+                        "nearest_sim": round(c.nearest_sim, 4),
+                        "cohesion": round(c.cohesion, 4),
+                    }
+                    for c in report.candidates
+                ],
+            }
+        print(json_mod.dumps(_serialise(report), indent=2))
+    else:
+        _print_consolidate(report, covered_threshold=args.covered)
+    return 0
+
+
+def _print_consolidate(report, covered_threshold: float = 0.68) -> None:
+    """Plain-text consolidation report."""
+    from datetime import datetime
+
+    print(f"{report.project_name}  ({report.project_root})")
+    print(
+        f"scanned {report.scanned_history_n} history · "
+        f"{report.total_decisions} decisions · "
+        f"{len(report.candidates)} candidate theme(s)  "
+        f"({report.covered_skipped_n} covered, {report.singletons_n} one-off)"
+    )
+    print(
+        "# candidates below are NOT recorded"
+        " — review and run `knowledge decide` yourself"
+    )
+
+    # ---- empty states ----
+    if report.scanned_history_n < 2:
+        print("(not enough history yet)")
+        return
+
+    total_clusters = len(report.candidates) + report.covered_skipped_n
+    if total_clusters == 0:
+        print(
+            f"(no recurring themes — all {report.scanned_history_n} entries are"
+            " unique by similarity; try --similarity 0.45 to widen)"
+        )
+        return
+
+    if not report.candidates and report.covered_skipped_n > 0:
+        print(
+            f"(all {report.covered_skipped_n} recurring theme(s) already covered"
+            " by existing decisions)"
+        )
+        return
+
+    # ---- per-candidate output ----
+    for k, c in enumerate(report.candidates, start=1):
+        notes = []
+        if c.has_near_dupes:
+            notes.append("near-duplicate entries")
+        if c.truncated:
+            notes.append("truncated")
+        note_str = f"  ({', '.join(notes)})" if notes else ""
+
+        print(f"\n# theme {k} — \"{c.suggested_topic}\"  ({len(c.entries)} entries){note_str}")
+
+        # Nearest decision line.
+        if c.nearest_decision:
+            d = c.nearest_decision
+            print(
+                f"  closest decision: #{d.id} \"{d.topic}\""
+                f" sim={c.nearest_sim:.2f}"
+                f" (< {covered_threshold} → not covered)"
+            )
+        else:
+            print("  no existing decisions")
+
+        # Entries.
+        print("  entries:")
+        for e in c.entries:
+            date_s = datetime.fromtimestamp(e.created_at).strftime("%Y-%m-%d")
+            print(f"    id={e.id} {date_s}  {e.short_summary}")
+
+        # Files.
+        if c.files:
+            print(f"  files: {', '.join(c.files)}")
+
+        # Scaffold.
+        files_arg = (
+            " --files " + " ".join(c.files) if c.files else ""
+        )
+        print(
+            f"  → consider: knowledge decide \"{c.suggested_topic}\""
+            f" --decision \"<FILL IN>\"{files_arg}"
+        )
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     """Hybrid search + rerank + cache — Phase 3 entry point for agents."""
     from . import hybrid_search
@@ -1256,6 +1578,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
         proj = _resolve_project_or_error(conn, args.project)
         if proj is None:
             return 1
+        # Cross-client cache-invalidation signal — no extra DB query, proj
+        # is already fetched. See knowledge/query_cache.py module docstring.
+        index_stamp = max(proj.last_build or 0, proj.last_update or 0)
         results = hybrid_search.ask(
             conn,
             query=args.question,
@@ -1265,6 +1590,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             lang=args.lang,
             top_k=args.top_k,
             use_cache=not args.no_cache,
+            index_stamp=index_stamp,
         )
 
     kept, omitted = hybrid_search.truncate_to_budget(results, args.budget)
@@ -1777,8 +2103,9 @@ _AGENTS_BLOCK_END = "<!-- END knowledge skill -->"
 
 # Per-IDE install matrix. `dest` is relative to the cwd repo (project scope) or
 # to $HOME (user scope). `dedicated` files are ours alone (copy/symlink, --force
-# to overwrite); non-dedicated files (AGENTS.md) are merged via a managed block
-# because users commonly keep their own content there.
+# to overwrite); non-dedicated files (AGENTS.md / GEMINI.md) are merged via a
+# managed block because users commonly keep their own content there — no
+# --force needed, re-installs just replace the block in place.
 _IDE_TARGETS = {
     "claude": {
         "sibling": "SKILL.md",
@@ -1802,6 +2129,15 @@ _IDE_TARGETS = {
         "sibling": "AGENTS.md",
         "project_dest": Path("AGENTS.md"),
         "user_dest": Path(".config/opencode/AGENTS.md"),
+        "dedicated": False,
+    },
+    "gemini": {
+        # Same generated sibling as codex/opencode (compact render) — gemini-cli
+        # just reads it from a differently-named file. Its own `contextFileName`
+        # setting can alternatively be pointed at AGENTS.md directly.
+        "sibling": "AGENTS.md",
+        "project_dest": Path("GEMINI.md"),
+        "user_dest": Path(".gemini/GEMINI.md"),
         "dedicated": False,
     },
 }
@@ -1954,6 +2290,36 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
         )
         print("  knowledge config check-env")
     return rc
+
+
+def cmd_skill_show(args: argparse.Namespace) -> int:
+    """Print the full canonical skill body (frontmatter stripped).
+
+    The progressive-disclosure escape hatch: compact IDE renders (AGENTS.md /
+    GEMINI.md) end with "Full guide: run `knowledge skill show`" because their
+    always-on context budget can't hold the complete guide. Reuses the same
+    ``skill-template/SKILL.md`` resolution as ``cmd_install_skill``.
+    """
+    from . import skill_render
+
+    src_dir = Path(__file__).resolve().parent.parent / "skill-template"
+    skill_path = src_dir / "SKILL.md"
+    if not skill_path.is_file():
+        print(
+            f"error: skill template not found at {skill_path}\n"
+            "expected the repo-knowledge repo layout (editable install).",
+            file=sys.stderr,
+        )
+        return 1
+
+    skill_text = skill_path.read_text(encoding="utf-8")
+    print(skill_render.strip_frontmatter(skill_text).lstrip("\n"))
+    return 0
+
+
+_SKILL_DISPATCH = {
+    "show": cmd_skill_show,
+}
 
 
 def cmd_install_hooks(args: argparse.Namespace) -> int:
@@ -3171,8 +3537,10 @@ _DISPATCH = {
     "map": cmd_map,
     "brief": cmd_brief,
     "decide": cmd_decide,
+    "fact": cmd_fact,
     "decisions": cmd_decisions,
     "resume": cmd_resume,
+    "consolidate": cmd_consolidate,
     "get": cmd_get,
     "path": cmd_path,
     "projects": cmd_projects,
@@ -3184,8 +3552,10 @@ _DISPATCH = {
     "graph": cmd_graph,
     "install-skill": cmd_install_skill,
     "install-hooks": cmd_install_hooks,
+    "skill": lambda args: _SKILL_DISPATCH[args.skill_cmd](args),
     "config": lambda args: _CONFIG_DISPATCH[args.config_cmd](args),
     "db": lambda args: _DB_DISPATCH[args.db_cmd](args),
+    "daemon": lambda args: _DAEMON_DISPATCH[args.daemon_cmd](args),
 }
 
 
@@ -3357,7 +3727,10 @@ def cmd_db_init_postgres(args: argparse.Namespace) -> int:
 
     backend = PostgresBackend(s)
     try:
-        conn = backend.connect()
+        # init-postgres is where extension state can change (fresh install /
+        # recreation ⇒ new type OIDs) — bypass and rewrite the local type
+        # cache so it can never go stale across a re-init.
+        conn = backend.connect(refresh_types=True)
     except _DependencyMissing as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -3436,7 +3809,11 @@ def _ping_postgres(s) -> int:
 
     backend = PostgresBackend(s)
     try:
-        conn = backend.connect()
+        # ping is the triage verb — always re-fetch the pgvector type OIDs
+        # and rewrite the local type cache, so a server-side extension
+        # recreation (stale cached OIDs) is healed by the same command a
+        # user would naturally reach for.
+        conn = backend.connect(refresh_types=True)
     except _DependencyMissing as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -3633,6 +4010,81 @@ _DB_DISPATCH = {
     "ping": cmd_db_ping,
     "init-postgres": cmd_db_init_postgres,
     "migrate": cmd_db_migrate,
+}
+
+
+# ---------------------------------------------------------------------------
+# daemon subcommands (Item F — warm-embedder daemon)
+# ---------------------------------------------------------------------------
+
+
+def cmd_daemon_run(args: argparse.Namespace) -> int:
+    """Foreground server loop — the process the automatic spawn launches.
+
+    Always hosts the LOCAL embedder (``daemon.run_server`` builds its own
+    ``Embedder``; it never calls ``embedder.get_embedder()``), so the
+    daemon can't recurse into spawning itself. Exits on its own after
+    ``daemon.idle_timeout_seconds`` without requests, or on ``daemon stop``.
+    """
+    del args  # no flags — idle timeout comes from the config block
+    import logging
+
+    from . import daemon as daemon_mod
+
+    # The spawn path redirects our stdout/stderr to daemon.log; make the
+    # server's logging visible there (and on the terminal for manual runs).
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    daemon_mod.run_server()
+    return 0
+
+
+def cmd_daemon_status(args: argparse.Namespace) -> int:
+    """Report whether a daemon is serving. Exit 0 = running, 1 = not."""
+    del args
+    from . import daemon as daemon_mod
+
+    client = daemon_mod.DaemonEmbedder()
+    try:
+        info = client.ping()
+    except daemon_mod.DaemonUnavailable:
+        print("daemon: not running")
+        print(f"  socket: {paths.daemon_socket_path()}")
+        return 1
+
+    idle_s = max(0.0, time.time() - float(info.get("last_used", time.time())))
+    print("daemon: running")
+    print(f"  pid:     {info.get('pid')}")
+    print(f"  model:   {info.get('model')}")
+    print(f"  version: {info.get('version')}")
+    print(f"  idle:    {idle_s:.0f}s")
+    print(f"  socket:  {paths.daemon_socket_path()}")
+    return 0
+
+
+def cmd_daemon_stop(args: argparse.Namespace) -> int:
+    """Send the ``shutdown`` op. Exit 0 even when no daemon is running —
+    "make sure it's not running" is an idempotent request."""
+    del args
+    from . import daemon as daemon_mod
+
+    client = daemon_mod.DaemonEmbedder()
+    try:
+        info = client.ping()
+    except daemon_mod.DaemonUnavailable:
+        print("daemon: not running")
+        return 0
+    client.shutdown()
+    print(f"daemon: stopped (pid {info.get('pid')})")
+    return 0
+
+
+_DAEMON_DISPATCH = {
+    "run": cmd_daemon_run,
+    "status": cmd_daemon_status,
+    "stop": cmd_daemon_stop,
 }
 
 

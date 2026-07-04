@@ -58,7 +58,7 @@ def append(kind: str, root: Path, payload: dict[str, Any]) -> Path:
             if isinstance(payload.get(field), str):
                 payload[field] = scrub_text(payload[field])
     elif kind == "decision":
-        for field in ("topic", "decision", "rationale"):
+        for field in ("topic", "decision", "rationale", "context"):
             if isinstance(payload.get(field), str):
                 payload[field] = scrub_text(payload[field])
     path = paths.outbox_file(root)
@@ -139,6 +139,10 @@ def _apply(conn, entry: dict) -> None:
     payload = entry["payload"]
     kind = entry["kind"]
     if kind == "decision":
+        # Entries buffered by a pre-Item-H client never had `kind` in the
+        # payload — default to 'decision' so an old outbox file still drains
+        # cleanly against the current decisions.add() signature.
+        payload.setdefault("kind", "decision")
         decisions.add(conn, project_id=proj.id, **payload)
     elif kind == "history":
         history.add(conn, project_id=proj.id, **payload)

@@ -241,7 +241,11 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         -- a prior one — the override gate requires a justification comment.
         author          TEXT,
         supersedes      INTEGER,
-        override_reason TEXT
+        override_reason TEXT,
+        -- kind: 'decision' (choice among alternatives, default) or 'fact'
+        -- (a working fix / research finding recorded via `knowledge fact`).
+        -- Same row shape, same embedding index — see init_schema() backfill.
+        kind            TEXT    NOT NULL DEFAULT 'decision'
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_decisions_proj_time "
@@ -369,6 +373,15 @@ def init_schema(conn: Connection) -> None:
         conn.execute(
             "ALTER TABLE project_variables "
             "ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'"
+        )
+
+    # Additive backfill for decisions.kind (Item H — facts in the decisions
+    # store). Same pattern as project_variables.source above: NOT NULL DEFAULT
+    # keeps every pre-existing row a valid 'decision' without a backfill UPDATE.
+    have_cols = {row[1] for row in conn.execute("PRAGMA table_info(decisions)")}
+    if "kind" not in have_cols:
+        conn.execute(
+            "ALTER TABLE decisions ADD COLUMN kind TEXT NOT NULL DEFAULT 'decision'"
         )
 
     # Seed versions on first run. APSW auto-commits outside of explicit

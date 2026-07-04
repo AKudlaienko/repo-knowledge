@@ -79,7 +79,11 @@ CONFIG_TEMPLATE_JSON = """\
     }
   },
   "cache_bytes": 2147483648,
-  "embedding_model": null
+  "embedding_model": null,
+  "daemon": {
+    "enabled": true,
+    "idle_timeout_seconds": 1200
+  }
 }
 """
 
@@ -95,6 +99,25 @@ class PostgresSettings:
     connect_timeout_seconds: int = 10
 
 
+# Default idle-exit window for the embedder daemon (Item F). 20 minutes —
+# long enough to cover a burst of agent commands in one session, short
+# enough not to leave a warm model resident on a laptop indefinitely.
+_DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS = 1200
+
+
+@dataclass(frozen=True)
+class DaemonSettings:
+    """Optional ``daemon`` config block (see ``knowledge/daemon.py``).
+
+    Enabled by default; disable per-laptop via ``daemon.enabled: false`` in
+    the JSON config, or per-invocation via the ``KNOWLEDGE_NO_DAEMON=1`` env
+    var (env wins — see ``daemon.daemon_enabled()``).
+    """
+
+    enabled: bool = True
+    idle_timeout_seconds: int = _DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS
+
+
 @dataclass(frozen=True)
 class Settings:
     """Loaded runtime settings.
@@ -107,6 +130,7 @@ class Settings:
     postgresql: PostgresSettings | None = None
     cache_bytes: int = 2 * 1024 * 1024 * 1024
     embedding_model: str | None = None  # consumed by embedder._ensure_loaded()
+    daemon: DaemonSettings = field(default_factory=DaemonSettings)
     config_source: str = "default"
 
 
@@ -174,6 +198,8 @@ def load_settings(start_dir: Path | None = None) -> Settings:
             f"{config_path}: embedding_model must be a string or null"
         )
 
+    daemon_settings = _parse_daemon_block(raw.get("daemon"), source=str(config_path))
+
     # KNOWLEDGE_DATABASE_URL wins over the file's storage.mode — the same
     # precedence the resolution order has always documented. The file is still
     # parsed so cache_bytes / embedding_model carry over; only the backend
@@ -186,6 +212,7 @@ def load_settings(start_dir: Path | None = None) -> Settings:
         postgresql=pg_settings,
         cache_bytes=cache_bytes,
         embedding_model=embedding_model,
+        daemon=daemon_settings,
         config_source=str(config_path),
     )
 
@@ -281,6 +308,40 @@ def _parse_storage_block(
         ),
     )
     return pg_settings, mode
+
+
+def _parse_daemon_block(daemon_raw, source: str) -> DaemonSettings:
+    """Validate and unpack an optional ``daemon`` block.
+
+    Missing or empty block → defaults (``enabled=True``,
+    ``idle_timeout_seconds=1200``). Partial blocks are tolerated — any key
+    left out falls back to its default individually.
+    """
+
+    if not daemon_raw:
+        return DaemonSettings()
+    if not isinstance(daemon_raw, dict):
+        raise SettingsError(f"{source}: 'daemon' must be a mapping")
+
+    enabled = daemon_raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise SettingsError(f"{source}: daemon.enabled must be a boolean")
+
+    idle_timeout_raw = daemon_raw.get(
+        "idle_timeout_seconds", _DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS
+    )
+    try:
+        idle_timeout = int(idle_timeout_raw)
+    except (TypeError, ValueError):
+        raise SettingsError(
+            f"{source}: daemon.idle_timeout_seconds must be an integer"
+        ) from None
+    if idle_timeout <= 0:
+        raise SettingsError(
+            f"{source}: daemon.idle_timeout_seconds must be positive"
+        )
+
+    return DaemonSettings(enabled=enabled, idle_timeout_seconds=idle_timeout)
 
 
 # ---------------------------------------------------------------------------

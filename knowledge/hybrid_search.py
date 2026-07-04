@@ -29,6 +29,7 @@ from pathlib import Path
 
 from . import config, db, fts, paths, query_cache, search
 from .db import Connection
+from .embedder import get_embedder
 from .search import SearchResult
 
 
@@ -60,6 +61,7 @@ def ask(
     lang: str | None = None,
     top_k: int = config.DEFAULT_TOP_K,
     use_cache: bool = True,
+    index_stamp: float = 0.0,
 ) -> list[SearchResult]:
     """Full hybrid pipeline. Returns ``SearchResult`` list sorted by final score.
 
@@ -67,41 +69,49 @@ def ask(
     (lower is still "better" so the existing citations formatter doesn't
     need to flip signs). Call sites that care can recover the score as
     ``-r.distance``.
+
+    ``index_stamp`` should be ``max(last_build, last_update)`` from the
+    caller's already-fetched ``projects`` row — it's the cache's
+    cross-client invalidation signal (see ``knowledge/query_cache.py``).
+    Callers that don't have it (or don't care) can leave it at the
+    default; the cache then just keys on ``0.0``, which still round-trips
+    correctly but won't detect a stale index the way ``cmd_ask`` does.
     """
     fetch_k = max(top_k * _OVER_FETCH, 30)
 
-    # Cache lookup (pre-rerank).
+    # Cache lookup (pre-rerank) — LOCAL file, no main-DB round trip. This
+    # must stay before the embedder call below (whether it happens inside
+    # ``search.search`` on the sequential path or directly in
+    # ``_pg_pipelined_channels``): a cache hit must never pay the cost of
+    # loading the embedding model.
     cache_key = query_cache.compute_key(query, kind, lang, top_k)
     head_sha = query_cache.get_head_sha(project_root)
-    cached = query_cache.get(conn, project_id, cache_key, head_sha) if use_cache else None
+    cached = (
+        query_cache.get(project_root, cache_key, head_sha, index_stamp)
+        if use_cache else None
+    )
     if cached is not None:
         return _rerank(conn, cached, project_id, project_root)[:top_k]
 
-    # Both channels in one process — SQLite doesn't parallelize usefully
-    # across a single connection, and the embedder call dominates anyway
+    # PG: both channels ship in one pipelined round trip. SQLite: sequential
+    # (pipeline mode is a psycopg-only concept) — a single connection
+    # doesn't parallelize usefully anyway, and the embedder call dominates
     # (first call loads the model; subsequent are fast).
-    vec_results = search.search(
-        conn, query, project_id=project_id, kind=kind, lang=lang, top_k=fetch_k
-    )
-    fts_query = _to_fts_match(query)
-    fts_results: list[SearchResult] = []
-    if fts_query:
-        try:
-            fts_results = fts.grep(
-                conn, fts_query, project_id=project_id,
-                kind=kind, lang=lang, limit=fetch_k,
-            )
-        except Exception:
-            # Malformed FTS5 query from adversarial input shouldn't kill
-            # the whole ask — fall back to vec-only ranking.
-            fts_results = []
+    if db.current_mode() == "postgresql":
+        vec_results, fts_results = _pg_pipelined_channels(
+            conn, query, project_id, kind, lang, fetch_k
+        )
+    else:
+        vec_results, fts_results = _sequential_channels(
+            conn, query, project_id, kind, lang, fetch_k
+        )
 
     merged = _rrf_merge(vec_results, fts_results, limit=fetch_k)
 
     # Cache the pre-rerank output so the next call with the same query
     # skips FTS + vec + JOIN.
     if use_cache:
-        query_cache.put(conn, project_id, cache_key, head_sha, merged)
+        query_cache.put(project_root, cache_key, head_sha, index_stamp, merged)
 
     return _rerank(conn, merged, project_id, project_root)[:top_k]
 
@@ -155,6 +165,94 @@ def _to_fts_match(query: str) -> str:
     if not tokens:
         return ""
     return " OR ".join(tokens)
+
+
+def _sequential_channels(
+    conn: Connection,
+    query: str,
+    project_id: int | None,
+    kind: str | None,
+    lang: str | None,
+    fetch_k: int,
+) -> tuple[list[SearchResult], list[SearchResult]]:
+    """Run the vector + FTS channels sequentially — one round trip each.
+
+    This is the ORIGINAL (pre-pipeline) control flow. SQLite always uses
+    it — pipeline mode is a psycopg-only concept — and the PG pipeline
+    path (:func:`_pg_pipelined_channels`) falls back to this exact code on
+    any pipeline failure, so behavior degrades to precisely what shipped
+    before pipeline mode.
+    """
+    vec_results = search.search(
+        conn, query, project_id=project_id, kind=kind, lang=lang, top_k=fetch_k
+    )
+    fts_query = _to_fts_match(query)
+    fts_results: list[SearchResult] = []
+    if fts_query:
+        try:
+            fts_results = fts.grep(
+                conn, fts_query, project_id=project_id,
+                kind=kind, lang=lang, limit=fetch_k,
+            )
+        except Exception:
+            # Malformed FTS query from adversarial input shouldn't kill
+            # the whole ask — fall back to vec-only ranking.
+            fts_results = []
+    return vec_results, fts_results
+
+
+def _pg_pipelined_channels(
+    conn: Connection,
+    query: str,
+    project_id: int | None,
+    kind: str | None,
+    lang: str | None,
+    fetch_k: int,
+) -> tuple[list[SearchResult], list[SearchResult]]:
+    """Run the vector + FTS channels in one PG pipeline round trip.
+
+    Embedding happens first (local CPU, unchanged relative to the
+    sequential path) so both statements can be built and queued before
+    anything touches the network. Both ``conn.execute`` calls are issued
+    inside ``with conn.pipeline():``; results are fetched only AFTER the
+    block exits (fetching inside would force an early sync — see
+    psycopg3 pipeline-mode docs). The FTS statement is skipped entirely
+    when :func:`fts.build_pg_grep_query` returns ``None`` (empty/garbage
+    pattern — nothing to search for).
+
+    ``to_tsquery`` can raise on adversarial input, and in pipeline mode
+    one failed statement aborts the whole batch. On ANY exception here we
+    roll the connection back and re-run :func:`_sequential_channels` (the
+    exact code used today) so a malformed query degrades to vec-only
+    ranking instead of killing ``ask`` — pipeline mode requires plain PG
+    or a session-pooling proxy; older transaction-pooling pgbouncer setups
+    that don't support protocol pipelining hit this same fallback.
+    """
+    embedder = get_embedder()
+    q_vec = embedder.encode([query])[0]
+
+    vec_sql, vec_params = search.build_pg_vector_query(
+        q_vec, project_id, kind, lang, fetch_k
+    )
+    fts_query = _to_fts_match(query)
+    built_fts = (
+        fts.build_pg_grep_query(fts_query, project_id, kind, lang, fetch_k)
+        if fts_query else None
+    )
+
+    try:
+        with conn.pipeline():
+            cur_v = conn.execute(vec_sql, vec_params)
+            cur_f = conn.execute(*built_fts) if built_fts is not None else None
+        vec_results = search.rows_to_results(cur_v.fetchall())
+        fts_results = (
+            fts.parse_grep_rows(cur_f.fetchall(), fetch_k)
+            if cur_f is not None else []
+        )
+        return vec_results, fts_results
+    except Exception:
+        conn.rollback()
+        return _sequential_channels(conn, query, project_id, kind, lang, fetch_k)
 
 
 def _rrf_merge(

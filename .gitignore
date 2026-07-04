@@ -19,7 +19,6 @@ venv/
 .DS_Store
 .claude/
 tasks/
-tests/
 .idea/
 .aider.*
 uv.lock

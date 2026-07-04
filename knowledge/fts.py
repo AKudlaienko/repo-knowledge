@@ -86,7 +86,7 @@ def find(
     """
     params.extend([name, limit])
     rows = db.fetch_all(conn, sql, tuple(params))
-    return [_row_to_result(r) for r in rows]
+    return [row_to_result(r) for r in rows]
 
 
 def grep(
@@ -146,33 +146,48 @@ def _grep_sqlite(
     """
     params.append(k_fetch)
     rows = conn.execute(sql, params).fetchall()
-    return [_row_to_result(r) for r in rows[:limit]]
+    return [row_to_result(r) for r in rows[:limit]]
 
 
-def _grep_postgres(
-    conn: Connection,
+def build_pg_grep_query(
     pattern: str,
     project_id: int | None,
     kind: str | None,
     lang: str | None,
     limit: int,
-) -> list[SearchResult]:
+) -> tuple[str, list] | None:
+    """Pure builder for the PG lexical-grep query. No DB access — callable
+    to prepare a statement for either a direct ``cur.execute`` or a
+    pipelined ``conn.execute`` (see
+    ``hybrid_search._pg_pipelined_channels``).
+
+    Returns ``None`` when ``pattern`` doesn't survive :func:`_to_tsquery`
+    (empty/garbage input) — callers should skip the FTS channel entirely
+    rather than run a query with no predicate.
+
+    Param shape: ``tsquery`` is bound twice — once for the SELECT
+    ``ts_rank_cd`` projection, once for the WHERE ``@@`` filter. Unlike the
+    vector query (decision id=102), both ``tsquery`` placeholders are
+    *adjacent* in the SQL text (SELECT projection immediately followed by
+    the WHERE clause, with filters coming after both), so the correct
+    param list is ``[tsquery, tsquery, *filter_params, limit]``.
+    """
     tsquery = _to_tsquery(pattern)
     if not tsquery:
-        return []
+        return None
     k_fetch = limit * 3 if (project_id or kind or lang) else limit
 
     where: list[str] = ["c.search_vector @@ to_tsquery('english', %s)"]
-    params: list = [tsquery]
+    filter_params: list = []
     if project_id is not None:
         where.append("c.project_id = %s")
-        params.append(project_id)
+        filter_params.append(project_id)
     if kind:
         where.append("c.kind = %s")
-        params.append(kind)
+        filter_params.append(kind)
     if lang:
         where.append("f.lang = %s")
-        params.append(lang)
+        filter_params.append(lang)
 
     sql = f"""
         SELECT {_CHUNK_COLS},
@@ -184,16 +199,38 @@ def _grep_postgres(
         ORDER BY rank DESC
         LIMIT %s
     """
-    # tsquery bound twice — once for the WHERE @@ filter, once for the
-    # ts_rank_cd column. Same trick as the vector search: param binds for
-    # the filter and the projection are independent.
-    params = [tsquery, *params, k_fetch]
+    params = [tsquery, tsquery, *filter_params, k_fetch]
+    return sql, params
+
+
+def _grep_postgres(
+    conn: Connection,
+    pattern: str,
+    project_id: int | None,
+    kind: str | None,
+    lang: str | None,
+    limit: int,
+) -> list[SearchResult]:
+    built = build_pg_grep_query(pattern, project_id, kind, lang, limit)
+    if built is None:
+        return []
+    sql, params = built
     with conn.cursor() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
-    # Trim ``rank`` so the row shape matches _CHUNK_COLS (the SearchResult
-    # builder doesn't store rank — we only used it for ORDER BY).
-    return [_row_to_result(r[:11]) for r in rows[:limit]]
+    return parse_grep_rows(rows, limit)
+
+
+def parse_grep_rows(rows, limit: int) -> list[SearchResult]:
+    """Convert raw PG grep rows into ``SearchResult``.
+
+    Trims the trailing ``rank`` column (present for ``ORDER BY`` only —
+    the ``SearchResult`` builder doesn't store it) and applies the same
+    over-fetch limit slicing as ``_grep_postgres``. Exposed (not private)
+    so ``hybrid_search`` can convert rows fetched from a pipelined
+    ``conn.execute`` the same way.
+    """
+    return [row_to_result(r[:11]) for r in rows[:limit]]
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +348,7 @@ def _find_regex(
         for row in db.fetch_all(conn, sql, tuple(params)):
             name, qname = row[2], row[3]
             if (name and rx.search(name)) or (qname and rx.search(qname)):
-                out.append(_row_to_result(row))
+                out.append(row_to_result(row))
                 if len(out) >= limit:
                     break
     return out
@@ -322,7 +359,7 @@ def _escape_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _row_to_result(r) -> SearchResult:
+def row_to_result(r) -> SearchResult:
     return SearchResult(
         chunk_id=r[0],
         kind=r[1],

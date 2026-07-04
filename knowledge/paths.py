@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -40,6 +41,16 @@ def models_dir() -> Path:
     p = user_dir() / "models"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def pg_types_cache_path() -> Path:
+    """``~/.knowledge/pg_types_cache.json`` — cached pgvector type OIDs.
+
+    Keyed by sha256(host|port|dbname) so one file can hold entries for every
+    PostgreSQL target this laptop has connected to. See
+    ``backends/postgres.py`` module docstring for the invalidation story.
+    """
+    return user_dir() / "pg_types_cache.json"
 
 
 # Project-scoped config file name. Dropped into a repo root (or any cwd
@@ -146,6 +157,25 @@ def outbox_file(root: Path) -> Path:
     return project_stage_dir(root) / "outbox.jsonl"
 
 
+def query_cache_dir() -> Path:
+    """``~/.knowledge/cache/`` — local per-project query-cache files."""
+    p = user_dir() / "cache"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def query_cache_db(root: Path) -> Path:
+    """Per-project local SQLite file backing ``query_cache.py``.
+
+    Slug derivation mirrors :func:`project_stage_dir` (same
+    ``_slugify_root`` helper) so a repo root maps to a stable filename
+    regardless of storage mode (local sqlite or shared_postgresql) — the
+    query cache is local-only in both. Creates the parent dir; the file
+    itself is created lazily by ``query_cache.py`` on first connect.
+    """
+    return query_cache_dir() / f"{_slugify_root(root)}.sqlite"
+
+
 def root_sidecar_path(project_dir: Path) -> Path:
     """``.root`` sidecar holding the absolute repo path for ``project_dir``.
 
@@ -153,6 +183,63 @@ def root_sidecar_path(project_dir: Path) -> Path:
     project without re-hashing every registered root.
     """
     return project_dir / ".root"
+
+
+def daemon_dir() -> Path:
+    """``~/.knowledge/daemon/`` — embedder-daemon socket + log (Item F).
+
+    Path-only; does NOT create or validate permissions. Callers that intend
+    to actually use the socket must go through
+    :func:`ensure_daemon_dir_safe`, which is the single place perms/symlink
+    checks happen (server startup and, transitively, the client's
+    connect-or-spawn decision).
+    """
+    return user_dir() / "daemon"
+
+
+def ensure_daemon_dir_safe() -> Path | None:
+    """Create (0700) or validate ``daemon_dir()``; return ``None`` if unsafe.
+
+    Mirrors the care taken with ``pg_types_cache_path()`` writes, but goes
+    one step further: rather than silently re-chmod'ing a looser-permission
+    or symlinked dir back to 0700 (which could paper over a planted symlink
+    on a shared host), an existing dir that isn't a real 0700 directory is
+    treated as untrusted and rejected outright. Callers (client and server)
+    must fall back to the local in-process embedder in that case rather
+    than touching the socket.
+    """
+    p = daemon_dir()
+    if p.is_symlink():
+        return None
+    if p.exists():
+        try:
+            st = p.stat()
+        except OSError:
+            return None
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        if stat.S_IMODE(st.st_mode) & 0o077:
+            return None
+        return p
+    try:
+        p.mkdir(parents=True, mode=0o700, exist_ok=False)
+    except OSError:
+        return None
+    try:
+        p.chmod(0o700)  # belt-and-suspenders — mkdir's mode is umask-masked
+    except OSError:
+        pass
+    return p
+
+
+def daemon_socket_path() -> Path:
+    """``~/.knowledge/daemon/embed.sock`` — the embedder daemon's Unix socket."""
+    return daemon_dir() / "embed.sock"
+
+
+def daemon_log_path() -> Path:
+    """``~/.knowledge/daemon/daemon.log`` — stdout/stderr of a spawned daemon."""
+    return daemon_dir() / "daemon.log"
 
 
 def iter_stage_project_dirs() -> list[Path]:
