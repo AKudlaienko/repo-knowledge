@@ -77,6 +77,10 @@ CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_id);
 -- so the GIN index can be hit directly without recomputing on every read.
 -- The 'english' configuration gives reasonable code-symbol tokenization;
 -- swap to 'simple' if accent/stopword handling causes false negatives.
+-- translate(.., '<>', '  ') neutralizes angle brackets first: PG's parser
+-- otherwise classifies <Word> as an XML 'tag' token, which the config drops
+-- — losing msbuild element names and generic params like List<string>
+-- (see 004_fts_xml_tags.sql; keep both expressions in sync).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS chunks (
     id              BIGSERIAL PRIMARY KEY,
@@ -97,10 +101,11 @@ CREATE TABLE IF NOT EXISTS chunks (
     embedded_text   TEXT      NOT NULL,
     metadata        TEXT,
     search_vector   tsvector  GENERATED ALWAYS AS (
-        to_tsvector('english',
+        to_tsvector('english', translate(
             coalesce(name, '')           || ' ' ||
             coalesce(qualified_name, '') || ' ' ||
-            stored_text)
+            stored_text,
+            '<>', '  '))
     ) STORED
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_project ON chunks(project_id);

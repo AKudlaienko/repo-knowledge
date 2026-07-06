@@ -17,8 +17,11 @@ from __future__ import annotations
 # shift subtly even though extraction code is unchanged. Forcing a rebuild
 # here avoids a silently-inconsistent index with some chunks parsed by the
 # old grammars and some by the new ones.
+# Bumped 3 -> 4: .NET support (C#, F#, VB, MSBuild project files). Previously
+# ignored extensions are now indexable; the forced rebuild makes existing
+# repositories pick them up on the next `knowledge update`.
 SCHEMA_VERSION = "2"
-CHUNKER_VERSION = "3"
+CHUNKER_VERSION = "4"
 
 # Embedding model. BAAI/bge-small-en-v1.5: 384-dim, ~130MB, strong MTEB
 # score for mixed code+text retrieval, 512-token window.
@@ -84,6 +87,19 @@ EXT_TO_LANG = {
     ".j2": "jinja",
     ".jinja": "jinja",
     ".jinja2": "jinja",
+    ".cs": "csharp",
+    ".csx": "csharp",
+    ".fs": "fsharp",
+    ".fsi": "fsharp",
+    ".fsx": "fsharp",
+    ".vb": "visual_basic",
+    # MSBuild project files. Chunked whole-file; their <ProjectReference>
+    # entries become dotnet_project_reference edges (C#/F#/VB source-level
+    # imports reference namespaces, not files, so project files are the
+    # only source of .NET file edges).
+    ".csproj": "msbuild",
+    ".fsproj": "msbuild",
+    ".vbproj": "msbuild",
     "Dockerfile": "dockerfile",  # matched by name, not extension
     ".md": "markdown",
     ".markdown": "markdown",

@@ -25,7 +25,7 @@ Local semantic code search, dependency cartography, and session memory. Default 
 | `gitignore.py` | `.gitignore` + `.knowledgeignore` handling | `load_specs`, `is_ignored` |
 | `sanitizer.py` | Regex scrub (L1) + sensitive-key replacement (L2) | `scrub_text`, `SECRET_PATTERNS`, `SENSITIVE_KEYS` |
 | `scanner.py` | Walk project, apply ignore rules, dispatch chunker | `walk_project`, `classify_file` |
-| `chunkers/` | Language → chunker registry + per-lang parsers | `dispatch_chunker`, `PythonChunker`, `HclChunker`, … |
+| `chunkers/` | Language → chunker registry + per-lang parsers | `dispatch_chunker`, `PythonChunker`, `HclChunker`, `CSharpChunker`, `FSharpChunker`, `VisualBasicChunker`, `MSBuildChunker`, … |
 | `big_split.py` | Oversized chunks → `big_parent` + `big_subchunk` | `split_if_oversized` |
 | `embedder.py` | sentence-transformers loader + batch encode | `Embedder`, `get_embedder` |
 | `indexer.py` | Scan → chunk → sanitize → embed → upsert; build + incremental update | `build_project`, `update_project` |
@@ -56,8 +56,12 @@ Local semantic code search, dependency cartography, and session memory. Default 
 | `ansible_resolver` | `ansible_*` | tasks, roles, modules via `ansible.cfg` |
 | `github_actions_resolver` | `gha_*` | local workflows/actions vs external `uses:` |
 | `kustomize_resolver` | `kustomize_*` | resources, bases, patches, generators |
+| `msbuild_resolver` | `dotnet_project_reference` | pure tree-sitter `xml` walk over `<ProjectReference>` in `.csproj`/`.fsproj`/`.vbproj` |
 
-YAML files are classified by path (`yaml_classifier.py`) before resolver dispatch.
+YAML files are classified by path (`yaml_classifier.py`) before resolver dispatch. C#/F#/VB source
+files (`csharp`/`fsharp`/`visual_basic` langs) intentionally have **no** resolver: `using`/`open`/
+`Imports` reference namespaces, not files — the .NET dependency graph comes from MSBuild
+`ProjectReference` alone.
 
 ## CLI verbs
 

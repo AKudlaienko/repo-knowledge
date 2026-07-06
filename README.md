@@ -254,6 +254,7 @@ granularity; `.gitignore` + `.knowledgeignore` are always honored.
 |---|:---:|---|
 | **Python** | ✅ | ✅ `import` / `from` / `importlib` / relative |
 | **JavaScript / TypeScript** | ✅ | ✅ `import` / `require()` / dynamic `import()` |
+| **.NET** — C# (`.cs`/`.csx`) · F# (`.fs`/`.fsi`/`.fsx`) · VB (`.vb`) · MSBuild (`.csproj`/`.fsproj`/`.vbproj`) | ✅ | ✅ MSBuild `<ProjectReference>` only — source `using`/`open`/`Imports` are namespaces, not files |
 | **Terraform / HCL** | ✅ | ✅ `module.source` / `templatefile()` / `file()` |
 | **Ansible** (YAML) | ✅ | ✅ playbooks / `include_*` / roles / modules (honors `ansible.cfg`) |
 | **Helm** (YAML) | ✅ | ✅ `Chart.yaml` deps / `{{ include }}` / `{{ template }}` |
@@ -269,6 +270,9 @@ granularity; `.gitignore` + `.knowledgeignore` are always honored.
 
 Dynamic relation paths (e.g. `include_tasks: "_tasks/{{ deploy_env }}/…"`) resolve once you
 set the variables — see [Dependency graph ↓](#-details).
+
+Adding .NET support bumped `CHUNKER_VERSION` 3→4: existing indexes rebuild automatically on
+the next `knowledge update`.
 
 </details>
 
@@ -396,7 +400,7 @@ knowledge relations knowledge/db.py --direction reverse  # who imports it
 knowledge relations stats
 ```
 
-**Coverage:** Python, JS/TS, Terraform/HCL, Helm (`Chart.yaml` + `{{ include }}`), Ansible (tasks/roles/modules via `ansible.cfg`), GitHub Actions, Kustomize, ArgoCD App-of-Apps. Output is compact JSON for LLMs; add `--pretty` for humans.
+**Coverage:** Python, JS/TS, Terraform/HCL, Helm (`Chart.yaml` + `{{ include }}`), Ansible (tasks/roles/modules via `ansible.cfg`), GitHub Actions, Kustomize, ArgoCD App-of-Apps, MSBuild (`dotnet_project_reference` from `<ProjectReference>` in `.csproj`/`.fsproj`/`.vbproj` — C#/F#/VB source `using`/`open`/`Imports` name namespaces, not files, so they create no edges). Output is compact JSON for LLMs; add `--pretty` for humans.
 
 **Dynamic paths** (`include_tasks: "_tasks/{{ deploy_env }}/…"`, Terraform `source = "./${var.env}"`):
 
@@ -492,6 +496,36 @@ gemini-cli also supports a `contextFileName` setting that can point at `AGENTS.m
 > 🔧 Maintainers: `AGENTS.md` and `knowledge.mdc` are generated from `SKILL.md` — run `make sync-skill` after editing it (CI guards drift via `tests/test_skill_sync.py`).
 
 Auto-builds on first use, auto-updates on file changes, prefers `ask`/`find`/`grep`/`why`/`map`/`brief`/`resume`/`decide`.
+
+**OpenCode + a company-local LLM** — no `knowledge` code change is required: OpenCode owns the chat-model connection, while `knowledge` remains a shell CLI with its own local embedding model. Install from a cloned checkout using the repo-root flow above (`pip install -e .`); wheel/package installation is not supported yet. Then install the instructions and configure an OpenAI-compatible company endpoint:
+
+```bash
+knowledge install-skill --ide opencode --user
+```
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "company/company-code-model",
+  "enabled_providers": ["company"],
+  "share": "disabled",
+  "provider": {
+    "company": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Company LLM",
+      "options": {
+        "baseURL": "{env:COMPANY_LLM_BASE_URL}",
+        "apiKey": "{env:COMPANY_LLM_API_KEY}"
+      },
+      "models": {
+        "company-code-model": { "name": "Company code model" }
+      }
+    }
+  }
+}
+```
+
+Keep credentials in environment variables, ensure `knowledge` is on OpenCode's `PATH`, and use a model with reliable tool calling. The example targets `/v1/chat/completions`; use OpenCode's `@ai-sdk/openai` provider for a `/v1/responses` endpoint. In an air-gapped environment, pre-seed `~/.knowledge/models/` before the first `knowledge build`. See OpenCode's [custom-provider guide](https://opencode.ai/docs/providers) for endpoint-specific options.
 
 **Hooks (optional)** — auto-flush staged summaries at compaction / session end:
 
@@ -711,6 +745,8 @@ The embedder retrieves best when the query hints at *what kind of thing* you wan
 | JS / TS function | `javascript function:` | `function` |
 | Terraform resource / variable / output / module / locals | `terraform resource:` (etc.) | `resource` / `variable` / `output` / `module` / `locals_block` |
 | Ansible task / handler | `ansible task:` / `handler:` | `ansible_task` / `ansible_handler` |
+| C# / F# / VB type | `csharp class:` / `fsharp module:` / `visual_basic class:` | `class` / `struct` / `interface` / `record` / `enum` / `delegate` / `module` / `function` / `value` (+ `--lang`) |
+| MSBuild project | `msbuild project:` | `msbuild_project` |
 | Helm template / values | `helm template:` / `values:` | `helm_template` / `helm_values_section` |
 | K8s manifest | `kubernetes Deployment:` (etc.) | `yaml_doc` (+ `--lang yaml`) |
 | Shell function | `shell function:` | `shell_function` |
