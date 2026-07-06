@@ -30,6 +30,8 @@ class Edge:
     * ``require``         — ``require('foo')`` (JS/CommonJS)
     * ``dynamic_import``  — ``import('foo')`` (JS) with string-literal arg,
                             or ``importlib.import_module('foo')`` (Python)
+    * ``dotnet_project_reference`` — MSBuild ``<ProjectReference Include=
+                            "…">`` (``.csproj``/``.fsproj``/``.vbproj``)
     * ``unresolved``      — the import target is an expression we can't
                             resolve statically (``{{ var }}``, template
                             literals in dynamic imports, etc.). ``raw``

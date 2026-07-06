@@ -263,6 +263,8 @@ The embedding model retrieves best when the query hints at *what kind of thing* 
 | Terraform locals | `terraform locals:` | `locals_block` or `locals_entry` |
 | Ansible task | `ansible task:` | `ansible_task` |
 | Ansible handler | `ansible handler:` | `ansible_handler` |
+| C# / F# / VB type | `csharp class:` / `fsharp module:` / `visual_basic class:` | `class` / `struct` / `interface` / `record` / `enum` / `delegate` / `module` / `function` / `value` (+ `--lang`) |
+| MSBuild project | `msbuild project:` | `msbuild_project` |
 | Helm template | `helm template:` | `helm_template` |
 | Helm values key | `helm values:` | `helm_values_section` |
 | K8s manifest | `kubernetes <Kind>:` (e.g. `kubernetes Deployment:`) | `yaml_doc` + `--lang yaml` |
@@ -430,6 +432,7 @@ Add `--pretty` for human-readable output when you want to show the user directly
 - **Ansible**: `import_playbook`, `include_tasks` / `import_tasks`, `include_role` / `import_role` / `roles:`, `vars_files`, `include_vars`. Role resolution honors `ansible.cfg` `roles_path` — multi-cfg / non-root layouts work (e.g. `ansible/ansible.cfg` with `roles_path = roles` resolves to `ansible/roles/`). `tasks_from:` on an include_role narrows the target to the specific task file. Custom modules in `library/` + `action_plugins/` (or wherever `ansible.cfg` points) produce `ansible_module` edges — builtin modules (`debug`, `copy`, …) don't clutter the graph.
 - **GitHub Actions**: `uses: ./.github/workflows/*.yml` (reusable workflows), `uses: ./.github/actions/*` (local composite actions → their `action.yml`), `uses: owner/repo@ref` → external.
 - **Kustomize**: `kustomization.yaml` `resources`, `bases`, `components`, `patchesStrategicMerge`, `patches[].path`, `configMapGenerator`/`secretGenerator.files`. A `resources:` entry that's a directory is resolved to its nested `kustomization.yaml`. Plain (non-kustomize) k8s manifests have no edges.
+- **.NET / MSBuild**: `<ProjectReference Include="…">` in `.csproj`/`.fsproj`/`.vbproj` → `dotnet_project_reference` edges (semicolon lists split; Windows `\` normalized; `$(...)` properties and globs land as `unresolved`). **C#/F#/VB source files get no resolver on purpose** — `using`/`open`/`Imports` name namespaces, not files, so they never create edges; the project graph comes from MSBuild alone.
 - **Plain YAML / Markdown / other files without a resolver**: `knowledge relations <file>` returns the file's same-directory siblings (with lang) under a `siblings` key — a "where does this file live" hint rather than a real dep.
 
 ### Freshness

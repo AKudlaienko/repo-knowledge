@@ -373,6 +373,8 @@ def _resolver_for(lang: str):
     if lang == "yaml":
         # YAML flavors all share one dispatcher that picks on edge.kind.
         return _resolve_yaml
+    if lang == "msbuild":
+        return _resolve_msbuild
     return None
 
 
@@ -864,6 +866,34 @@ def _resolve_kustomize(
         if fid is not None:
             return fid
     return None
+
+
+# ---------------------------------------------------------------------------
+# MSBuild resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_msbuild(
+    edge: Edge, index: FileIndex, source_rel: str
+) -> int | None:
+    """Resolve a ``dotnet_project_reference`` edge to its target project.
+
+    ``raw`` is the literal ``Include`` path exactly as MSBuild resolver
+    saw it — Windows ``\\`` separators and all. MSBuild treats both
+    separators as path components on every OS, so normalize to ``/``
+    first, then reuse the same source-dir-relative join + ``..``
+    collapsing rule every other path-flavored resolver uses. A path that
+    escapes the project root (leading ``..`` surviving normalization)
+    can't be a project file — return None rather than guessing.
+    """
+    raw = edge.raw
+    if not raw:
+        return None
+    posix_raw = raw.replace("\\", "/")
+    rel_target = _resolve_relative(source_rel, posix_raw)
+    if rel_target is None:
+        return None
+    return index.find(rel_target)
 
 
 # ---------------------------------------------------------------------------

@@ -29,16 +29,20 @@ from .github_actions_resolver import GitHubActionsResolver
 from .helm_resolver import HelmResolver
 from .javascript_resolver import JavaScriptResolver, TypeScriptResolver
 from .kustomize_resolver import KustomizeResolver
+from .msbuild_resolver import MSBuildResolver
 from .python_resolver import PythonResolver
 from .terraform_resolver import TerraformResolver
 from .yaml_classifier import classify_yaml_path
 
-# Non-YAML languages: one resolver per lang tag.
+# Non-YAML languages: one resolver per lang tag. C#/F#/VB source files get
+# no resolver on purpose: their using/open/Imports reference namespaces,
+# not files — .NET file edges come from MSBuild <ProjectReference> only.
 _SIMPLE_RESOLVERS: dict[str, type[BaseResolver]] = {
     "python":     PythonResolver,
     "javascript": JavaScriptResolver,
     "typescript": TypeScriptResolver,
     "hcl":        TerraformResolver,
+    "msbuild":    MSBuildResolver,
 }
 
 # YAML flavors (from ``classify_yaml_path``) → tuple of resolver classes
